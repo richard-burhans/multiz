@@ -6,6 +6,7 @@
 #   laila_release.sh build                    (in the job, from the bundle root) build base/ and simd/, unpack $DATA
 #   laila_release.sh run KIND BUILD ROUND     (in the job) one timed run; KIND deep | piece03 | cannabis
 #   laila_release.sh compare                  (in the job) every KIND must have one digest across builds and rounds
+#   laila_release.sh summarize RESULTS_DIR    (local) per kind and build: median user s, cycles, instructions, IPC
 #
 # Workloads:
 #   deep      the cannabis deep merge, multiz M=1 left.maf right.maf (bench/data/wfi_profile/in)
@@ -75,6 +76,24 @@ compare)
 		else echo "DIFFER $kind: $n digests"; rc=1; fi
 	done
 	exit $rc
+	;;
+summarize)
+	# (local) laila_release.sh summarize RESULTS_DIR: per kind and build, medians over rounds of user s, cycles,
+	# instructions, IPC and branch-miss rate, joining run_N in counters.tsv to the Nth RESULT line of run.log
+	R=$1
+	awk 'FNR == NR { if ($1 ~ /^run_/ && $2 != "event") v[$1, $2] = $6; next }
+	     /^RESULT/ { n++; r = "run_" n; print $2, $3, $6, v[r, "cycles"], v[r, "instructions"], v[r, "branches"], v[r, "branch-misses"] }' \
+		"$R/counters.tsv" "$R/run.log" |
+	sort -k1,1 -k2,2 | awk '
+	function med(a, m,   t, i, j) { for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++) if (a[j] < a[i]) { t = a[i]; a[i] = a[j]; a[j] = t }
+	                                 return m % 2 ? a[(m + 1) / 2] : (a[m / 2] + a[m / 2 + 1]) / 2 }
+	function flush() { if (key == "") return
+	  printf "%s\t%s\t%d\t%.1f\t%.3e\t%.3e\t%.3f\t%.4f\n", k1, k2, m, med(U, m), med(C, m), med(I, m), med(P, m), med(B, m)
+	  split("", U); split("", C); split("", I); split("", P); split("", B); m = 0 }
+	BEGIN { print "kind\tbuild\truns\tuser_s\tcycles\tinstructions\tIPC\tbranch_miss_rate" }
+	{ if ($1 SUBSEP $2 != key) { flush(); key = $1 SUBSEP $2; k1 = $1; k2 = $2 }
+	  m++; U[m] = $3; C[m] = $4; I[m] = $5; P[m] = $5 / $4; B[m] = $7 / $6 }
+	END { flush() }'
 	;;
 *) echo "usage: see the header" >&2; exit 2 ;;
 esac
