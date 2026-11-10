@@ -271,6 +271,68 @@ static score_t i_avx2(int lo, int hi, const score_t *cC, const score_t *cD,
 #endif
 #endif
 
+#ifdef YAMA_SHADOW
+/* Shadow mode (test instrument): every row is recomputed by a copy of the
+*  scalar code into separate buffers and compared cell by cell with what the
+*  production path (vector kernels plus scalar edges) stored: C, D and I
+*  values and every traceback flag.  The first mismatch aborts.  Counters,
+*  printed at exit, show how many cells were compared and how many rows went
+*  through each kernel, so a run that compared nothing cannot pass silently.
+*/
+#include <stdio.h>
+static unsigned long long sh_calls, sh_rows, sh_cells, sh_p1_vrows, sh_p1_vcells,
+       sh_p2_vrows, sh_p2_vcells, sh_unfit_rows;
+static score_t sh_vmin = LLONG_MAX, sh_vmax = LLONG_MIN, sh_vmin_nonsentinel = LLONG_MAX,
+               sh_zmax, sh_emax;
+static void sh_report(void) {
+    /* YAMA_SHADOW_LOG names a file to append the counters to as well, for
+    *  drivers that discard stderr (tests/run.sh, roast's children). */
+    const char *lp = getenv("YAMA_SHADOW_LOG");
+    FILE *f = lp ? fopen(lp, "a") : NULL;
+    int i;
+    for (i = 0; i < 2; ++i) {
+        FILE *o = i ? f : stderr;
+        if (!o)
+            continue;
+        fprintf(o, "YAMA_SHADOW calls=%llu rows=%llu cells=%llu p1_vec_rows=%llu "
+            "p1_vec_cells=%llu p2_vec_rows=%llu p2_vec_cells=%llu unfit_rows=%llu "
+            "vmin=%lld vmin_above_MININT=%lld vmax=%lld max_abs_Izc=%lld max_abs_eK=%lld\n",
+            sh_calls, sh_rows, sh_cells, sh_p1_vrows, sh_p1_vcells, sh_p2_vrows,
+            sh_p2_vcells, sh_unfit_rows, sh_vmin, sh_vmin_nonsentinel, sh_vmax,
+            sh_zmax, sh_emax);
+    }
+    if (f)
+        fclose(f);
+}
+static void sh_val(score_t v) {
+    if (v < sh_vmin) sh_vmin = v;
+    if (v > sh_vmax) sh_vmax = v;
+    if (v > MININT && v < sh_vmin_nonsentinel) sh_vmin_nonsentinel = v;
+}
+static void sh_fail(const char *field, int row, int col, long long got, long long want,
+                    int lb, int rb, int M, int N, int K, int L, int p1lo, int p1end,
+                    int p2lo, int p2end) {
+    fprintf(stderr, "YAMA_SHADOW MISMATCH field=%s row=%d col=%d production=%lld scalar=%lld "
+            "band=[%d,%d] M=%d N=%d K=%d L=%d p1_vec=[%d,%d) p2_vec=[%d,%d)\n",
+            field, row, col, got, want, lb, rb, M, N, K, L, p1lo, p1end, p2lo, p2end);
+    if (getenv("YAMA_SHADOW_LOG")) {
+        FILE *f = fopen(getenv("YAMA_SHADOW_LOG"), "a");
+        if (f) {
+            fprintf(f, "YAMA_SHADOW MISMATCH field=%s row=%d col=%d production=%lld scalar=%lld\n",
+                    field, row, col, got, want);
+            fclose(f);
+        }
+    }
+    sh_report();
+    abort();
+}
+#define SH_CMP(field, got, want) do { \
+        if ((long long)(got) != (long long)(want)) \
+            sh_fail(field, row, col, (long long)(got), (long long)(want), LB[row], RB[row], \
+                    M, N, K, L, sh_p1lo, sh_p1end, vlo, vend); \
+    } while (0)
+#endif
+
 // populate a column from a column of height K and a column of height L
 static void new_col(uchar *from1, int K, uchar *from2, int L, uchar *to_col) {
     //void new_col(uchar *from1, int K, uchar *from2, int L, uchar *to_col) {
@@ -302,6 +364,12 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
 #endif
 #if YAMA_SIMD && YAMA_SIMD_I
     long long *eK = NULL;
+#endif
+#ifdef YAMA_SHADOW
+    score_t *sC, *sD, sx, sy, sz, sV;
+    uchar *sfcd;
+    int sf, sg, sk, sh_p1lo, sh_p1end;
+    static int sh_registered;
 #endif
 
     if (LB[0] != 0 || RB[M] != N)
@@ -340,6 +408,16 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     cD = cC + (N+1);
     cI = cD + (N+1);
     fcd = ckalloc((N+1)*sizeof(uchar));
+#ifdef YAMA_SHADOW
+    if (!sh_registered) {
+        atexit(sh_report);
+        sh_registered = 1;
+    }
+    ++sh_calls;
+    sC = ckalloc(2*(size_t)(N+1)*sizeof(score_t));
+    sD = sC + (N+1);
+    sfcd = ckalloc((N+1)*sizeof(uchar));
+#endif
     for (col = 0; col <= N; ++col)
         cC[col] = cD[col] = cI[col] = MININT;
     pC[0] = pD[0] = pI[0] = 0;
@@ -456,6 +534,16 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     Izc = ckalloc((N+1)*sizeof(score_t));
     for (col = 1; col <= N; ++col)
         Izc[col] = DOT4(gb[col], Iz);
+#ifdef YAMA_SHADOW
+    for (col = 1; col <= N; ++col) {
+        sV = Izc[col] < 0 ? -Izc[col] : Izc[col];
+        if (sV > sh_zmax) sh_zmax = sV;
+        n = vb[col][0];
+        sV = n*K*gap_extend;
+        if (sV < 0) sV = -sV;
+        if (sV > sh_emax) sh_emax = sV;
+    }
+#endif
 
 #if YAMA_SIMD
     simd = __builtin_cpu_supports("avx2");
@@ -517,6 +605,19 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
                 vlo = vend = -1;
         }
 #endif
+#ifdef YAMA_SHADOW
+        sh_p1lo = vlo;
+        sh_p1end = vend;
+        ++sh_rows;
+#if YAMA_SIMD
+        if (simd && !rowok[row])
+            ++sh_unfit_rows;
+#endif
+        if (vlo >= 0) {
+            ++sh_p1_vrows;
+            sh_p1_vcells += vend - vlo;
+        }
+#endif
         for (col = LB[row]; col <= RB[row]; ++col) {
 #if YAMA_SIMD
             if (col == vlo) {
@@ -571,6 +672,54 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
             cD[col] = D;
             fcd[col] = flag_c | (flag_d<<2);
         }
+#ifdef YAMA_SHADOW
+        vlo = vend = -1;
+        for (col = LB[row]; col <= RB[row]; ++col) {	// copy of the scalar pass 1
+            if (col > LB[row-1]) {
+                sx = pC[col-1];
+                sy = pD[col-1];
+                sz = pI[col-1];
+                if (col > 1) {
+                    if (row > 1 && col > LB[row-2] + 1)
+                        sx -= DOT4(gb[col], rt[row].Cx);
+                    if (col > LB[row-1] + 1)
+                        sz -= DOT4(gb[col], rt[row].Cz);
+                    if (row > 1)
+                        sy -= vb[col][0]*rt[row].Cy[0] + vb[col][1]*rt[row].Cy[1];
+                }
+                BEST3(sx, sy, sz, sV, sf);
+                for (sk = 0; sk < nsym; ++sk)
+                    sV += hist[(size_t)col*nsym + sk]*wA[(size_t)row*nsym + sk];
+            } else {
+                sV = MININT;
+                sf = 0;
+            }
+            sC[col] = sV;
+            sx = pC[col];
+            sy = pD[col];
+            sz = pI[col];
+            if (0 < col && col < N) {
+                if (row > 1 && col > LB[row-2])
+                    sx -= vb[col][0]*rt[row].Dx[0] + vb[col][1]*rt[row].Dx[1];
+                if (row > 1)
+                    sy -= rt[row].Dy;
+                if (col > LB[row-1])
+                    sz -= vb[col][0]*rt[row].Dz[0] + vb[col][1]*rt[row].Dz[1];
+            }
+            BEST3(sx, sy, sz, sV, sg);
+            n = ua[row][0];
+            sV -= n*L*gap_extend;
+            sD[col] = sV;
+            sfcd[col] = sf | (sg<<2);
+            SH_CMP("C", cC[col], sC[col]);
+            SH_CMP("D", cD[col], sD[col]);
+            SH_CMP("flag_c", fcd[col] & 3, sf);
+            SH_CMP("flag_d", (fcd[col] >> 2) & 3, sg);
+            SH_CMP("fcd_high_bits", fcd[col] >> 4, 0);
+            sh_val(cC[col]);
+            sh_val(cD[col]);
+        }
+#endif
 
         /* Pass 2: I, which reads C, D and I at (row,col-1), left to right,
         *  then the traceback byte.
@@ -586,6 +735,12 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
             vend = vlo + ((RB[row] - vlo + 1) & ~3);
             if (vend <= vlo)
                 vlo = vend = -1;
+        }
+#endif
+#ifdef YAMA_SHADOW
+        if (vlo >= 0) {
+            ++sh_p2_vrows;
+            sh_p2_vcells += vend - vlo;
         }
 #endif
         for (col = LB[row] + 1; col <= RB[row]; ++col) {
@@ -628,6 +783,40 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
             // pack three flags into one byte of traceback memory
             *(tbp++) = fcd[col] | (flag_i << 4);
         }
+#ifdef YAMA_SHADOW
+        {   // copy of the scalar pass 2, against the stored I and traceback bytes
+            sV = MININT;
+            sf = 0;
+            col = LB[row];
+            SH_CMP("I", cI[col], sV);
+            SH_CMP("tback", tback_row[row][col], sfcd[col]);
+            sh_val(cI[col]);
+            ++sh_cells;
+            for (col = LB[row] + 1; col <= RB[row]; ++col) {
+                sx = cC[col-1];
+                sy = cD[col-1];
+                sz = sV;
+                if (row < M) {
+                    if (col > LB[row-1]+1)
+                        sx -= DOT4(gb[col], rt[row].Ix);
+                    if (col > LB[row]+1)
+                        sz -= Izc[col];
+                    sy -= vb[col][0]*rt[row].Iy[0] + vb[col][1]*rt[row].Iy[1];
+                }
+                BEST3(sx, sy, sz, sV, sf);
+                n = vb[col][0];
+                sV -= n*K*gap_extend;
+                SH_CMP("I", cI[col], sV);
+                SH_CMP("tback", tback_row[row][col], sfcd[col] | (sf << 4));
+                sh_val(cI[col]);
+                ++sh_cells;
+            }
+            if (tbp != tback_row[row] + RB[row] + 1)
+                sh_fail("tbp_advance", row, RB[row], (long long)(tbp - tback_row[row]),
+                        RB[row] + 1, LB[row], RB[row], M, N, K, L, sh_p1lo, sh_p1end,
+                        vlo, vend);
+        }
+#endif
         C = cC[RB[row]];
         D = cD[RB[row]];
 
@@ -720,6 +909,10 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     free(eK);
 #endif
     free(fcd);
+#ifdef YAMA_SHADOW
+    free(sC);
+    free(sfcd);
+#endif
     free(dashes);
     free(script);
 }

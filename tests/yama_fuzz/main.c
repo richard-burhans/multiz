@@ -12,6 +12,15 @@ int main(void) {
     uchar **A, **B, **AL;
     static char buf[1 << 16];
     init_scores70();
+    {   /* YAMA_FUZZ_GOP=n replaces every nonzero gap-open entry with n, so with
+        *  n near 2^28 the per-row coefficients pass 32 bits and yama must take
+        *  its scalar fallback (FITS32) on those rows. */
+        const char *g = getenv("YAMA_FUZZ_GOP");
+        if (g)
+            for (i = 0; i < 16; i++)
+                if (gop[i])
+                    gop[i] = atoi(g);
+    }
     while (scanf("%d %d", &K, &M) == 2) {
         A = (uchar **)ckalloc(M*sizeof(uchar *)) - 1;
         for (i = 1; i <= M; i++) { if (scanf("%s", buf) != 1) return 1; A[i] = (uchar *)copy_string(buf); }
