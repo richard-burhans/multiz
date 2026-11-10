@@ -15,6 +15,11 @@
 # Each run prints: RESULT kind build round wall_s user_s sys_s digest (sha256 of the output, '#' lines dropped).
 set -euo pipefail
 B=/home/rcb112/project/claude/bench/data
+# bash's own `time` (the gcc image has no /usr/bin/time): wall user sys, written to a file by tm()
+TIMEFORMAT='%R %U %S'
+tm() { local f=$1; shift; { time "$@"; } 2> "$f"; }
+# a failed run shows its stderr instead of dying silently under set -e
+failrun() { echo "RUN FAILED rc=$1 $kind $build $round" >&2; cat "$d"/err "$d"/*/err 2> /dev/null | tail -20 >&2; exit 1; }
 cmd=$1; shift
 case $cmd in
 pack)
@@ -41,24 +46,24 @@ run)
 	rm -rf "$d"; mkdir -p "$d"
 	case $kind in
 	deep)
-		/usr/bin/time -f "%e %U %S" -o "$d/time" "$bin/multiz" M=1 data/deep/left.maf data/deep/right.maf 0 \
-			"$d/U1.maf" "$d/U2.maf" > "$d/out.maf" 2> "$d/err"
+		tm "$d/time" sh -c '"$0" M=1 data/deep/left.maf data/deep/right.maf 0 "$1/U1.maf" "$1/U2.maf" > "$1/out.maf" 2> "$1/err"' \
+			"$bin/multiz" "$d" || failrun $?
 		dig=$(cat "$d/out.maf" "$d/U1.maf" "$d/U2.maf" | grep -v '^#' | sha256sum | cut -c1-64) ;;
 	piece03)
 		mkdir -p "$d/tmp"
 		for f in "$PWD"/data/piece03/hg38.*.sing.maf; do ln -s "$f" "$d/"; done
-		(cd "$d" && PATH="$bin:$PATH" /usr/bin/time -f "%e %U %S" -o time \
-			roast + T="$d/tmp" E=hg38 "$(cat "$OLDPWD/data/piece03/tree.nh")" hg38.*.sing.maf out.maf > /dev/null 2> err)
+		tree=$(cat data/piece03/tree.nh)
+		(cd "$d" && PATH="$bin:$PATH" tm time sh -c 'roast + T="$0/tmp" E=hg38 "$1" hg38.*.sing.maf out.maf > /dev/null 2> err' "$d" "$tree") || failrun $?
 		dig=$(grep -v '^#' "$d/out.maf" | sha256sum | cut -c1-64) ;;
 	cannabis)
 		files=$(ls "$PWD"/data/cannabis/inputs/*.maf | paste -sd, -)
-		(cd "$d" && PATH="$bin:$PATH" /usr/bin/time -f "%e %U %S" -o time \
-			sh "$OLDPWD/data/cannabis/multiz_roast.sh" cs10_NCBI_RefSeq_softmasked "$OLDPWD/data/cannabis/tree.nh" \
-			"$d/out.maf" "$files" > stdout 2> err)
+		top=$PWD
+		(cd "$d" && PATH="$bin:$PATH" tm time sh "$top/data/cannabis/multiz_roast.sh" cs10_NCBI_RefSeq_softmasked \
+			"$top/data/cannabis/tree.nh" "$d/out.maf" "$files") > "$d/stdout" 2> "$d/err" || failrun $?
 		dig=$(grep -v '^#' "$d/out.maf" | sha256sum | cut -c1-64) ;;
 	*) echo "unknown kind $kind" >&2; exit 2 ;;
 	esac
-	read -r wall user sys < "$d/time"
+	read -r wall user sys < <(tail -1 "$d/time") # the last line is time's; any earlier ones are the command's stderr
 	echo "RESULT $kind $build $round $wall $user $sys $dig" | tee -a runs/results.txt
 	rm -rf "$d"
 	;;
