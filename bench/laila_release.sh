@@ -4,7 +4,10 @@
 #
 #   laila_release.sh pack OUT.tar.gz          (local) tar the workloads' inputs, symlinks resolved; KINDS="..." picks
 #                                             which (default: deep piece03 cannabis)
-#   laila_release.sh build                    (in the job, from the bundle root) build base/ and simd/, unpack $DATA
+#   laila_release.sh build                    (in the job, from the bundle root) build base/ and simd/, unpack $DATA;
+#                                             also simd0/ (simd/ built -DYAMA_SIMD=0) and bench/maxrss
+# BUILD in `run` is base, simd, simd0, or simdenv0 (simd/'s binaries with YAMA_SIMD=0 in the environment: the
+# run-time override a user without AVX2 effectively gets).
 #   laila_release.sh run KIND BUILD ROUND     (in the job) one timed run; KIND deep | piece03 | cannabis
 #   laila_release.sh compare                  (in the job) every KIND must have one digest across builds and rounds
 #   laila_release.sh summarize RESULTS_DIR    (local) per kind and build: median user s, cycles, instructions, IPC
@@ -17,12 +20,14 @@
 #   piece04   hg38 100-way piece 04 (ucsc100way run04/inputs-v3), a second human piece
 #   cmed      WF-I piece NC_044376.1.02, 216 species, the median-weight piece of the retime study (1.3 GB of inputs)
 #   cheavy    WF-I piece NC_044379.1.12, 216 species, the heaviest piece of the retime study (2.2 GB of inputs)
-# Each run prints: RESULT kind build round wall_s user_s sys_s digest (sha256 of the output, '#' lines dropped).
+# Each run prints: RESULT kind build round wall_s user_s sys_s digest maxrss_kb (digest: sha256 of the output, '#'
+# lines dropped; maxrss_kb: the largest process in the run's tree, from bench/maxrss.c).
 set -euo pipefail
 B=/home/rcb112/project/claude/bench/data
 # bash's own `time` (the gcc image has no /usr/bin/time): wall user sys, written to a file by tm()
 TIMEFORMAT='%R %U %S'
-tm() { local f=$1; shift; { time "$@"; } 2> "$f"; }
+tm() { local f=$1; shift; { time "$MAXRSS" "$d/maxrss" "$@"; } 2> "$f"; }
+MAXRSS=$PWD/maxrss
 # a failed run shows its stderr instead of dying silently under set -e
 failrun() { echo "RUN FAILED rc=$1 $kind $build $round" >&2; cat "$d"/err "$d"/*/err 2> /dev/null | tail -20 >&2; exit 1; }
 cmd=$1; shift
@@ -52,11 +57,15 @@ pack)
 	;;
 build)
 	for t in base simd; do make -s -C "$t" multiz roast maf_project > "build_$t.log" 2>&1 || { tail "build_$t.log"; exit 1; }; done
+	rm -rf simd0 && cp -r simd simd0 && make -s -C simd0 clean > /dev/null 2>&1
+	make -s -C simd0 multiz roast maf_project CFLAGS="-Wall -Wextra -O2 -DYAMA_SIMD=0" > build_simd0.log 2>&1 || { tail build_simd0.log; exit 1; }
+	gcc -O2 -o maxrss simd/bench/maxrss.c
 	mkdir -p data && tar -C data -xzf "$DATA"
 	ls data/*
 	;;
 run)
 	kind=$1 build=$2 round=$3 bin=$PWD/$build
+	if [ "$build" = simdenv0 ]; then bin=$PWD/simd; export YAMA_SIMD=0; fi
 	d=$PWD/runs/$kind.$build.$round
 	rm -rf "$d"; mkdir -p "$d"
 	case $kind in
@@ -79,7 +88,7 @@ run)
 	*) echo "unknown kind $kind" >&2; exit 2 ;;
 	esac
 	read -r wall user sys < <(tail -1 "$d/time") # the last line is time's; any earlier ones are the command's stderr
-	echo "RESULT $kind $build $round $wall $user $sys $dig" | tee -a runs/results.txt
+	echo "RESULT $kind $build $round $wall $user $sys $dig $(cat "$d/maxrss" 2> /dev/null || echo NA)" | tee -a runs/results.txt
 	rm -rf "$d"
 	;;
 compare)
