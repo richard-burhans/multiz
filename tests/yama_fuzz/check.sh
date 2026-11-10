@@ -29,13 +29,15 @@ GOP=268435456
 # sanitizer and compiler-matrix runs (tests/validate.sh) cover this check too.
 FCC=${YAMA_FUZZ_CC:-gcc}
 FCFLAGS=${YAMA_FUZZ_CFLAGS:--O2}
+# YAMA_FUZZ_RUN prefixes every run of the built drivers, e.g. qemu-aarch64 for a cross build (tests/validate.sh cross)
+FRUN=${YAMA_FUZZ_RUN:-}
 build() {
 	$FCC $FCFLAGS -Wno-free-nonheap-object $2 -I"$T" "$H/main.c" "$T/mz_yama.c" "$T/mz_scores.c" "$T/util.c" \
 		-o "$W/$1" || { echo "FAIL yama fuzz: cannot build $1"; exit 1; }
 }
 build ref -DYAMA_SIMD=0
 build simd ""
-if grep -q -w avx2 /proc/cpuinfo 2> /dev/null; then :; else
+if [ -z "$FRUN" ] && grep -q -w avx2 /proc/cpuinfo 2> /dev/null; then :; else
 	echo "NOTE yama fuzz: this CPU has no AVX2, so both builds take the scalar path"
 fi
 fail=0
@@ -44,8 +46,8 @@ MODE=random
 cmpcase() {
 	label=$1 seed=$2 nc=$3; shift 3
 	python3 "$H/gen.py" "$seed" "$nc" 200 "$MODE" > "$W/in" || { echo "FAIL $label seed $seed: gen.py"; fail=1; return; }
-	env "$@" "$W/ref" < "$W/in" > "$W/ref.out" 2>&1
-	env "$@" "$W/simd" < "$W/in" > "$W/simd.out" 2>&1
+	env "$@" $FRUN "$W/ref" < "$W/in" > "$W/ref.out" 2>&1
+	env "$@" $FRUN "$W/simd" < "$W/in" > "$W/simd.out" 2>&1
 	if [ -s "$W/ref.out" ] && cmp -s "$W/ref.out" "$W/simd.out"; then
 		echo "PASS $label seed $seed"
 	else
@@ -61,12 +63,12 @@ for MODE in narrow ties edges; do
 	for s in 501 502 503; do cmpcase "yama fuzz targeted $MODE" $s 300; done
 done
 MODE=random
-"$W/ref" < "$H/real_cases.txt" > "$W/ref.out" 2>&1
-"$W/simd" < "$H/real_cases.txt" > "$W/simd.out" 2>&1
+$FRUN "$W/ref" < "$H/real_cases.txt" > "$W/ref.out" 2>&1
+$FRUN "$W/simd" < "$H/real_cases.txt" > "$W/simd.out" 2>&1
 if [ -s "$W/ref.out" ] && cmp -s "$W/ref.out" "$W/simd.out"; then echo "PASS yama fuzz real cases"; else echo "FAIL yama fuzz real cases"; fail=1; fi
 # the run-time override: the dispatch build with YAMA_SIMD=0 must equal the scalar reference too
 python3 "$H/gen.py" 7 300 200 > "$W/in"
-"$W/ref" < "$W/in" > "$W/ref.out" 2>&1
-YAMA_SIMD=0 "$W/simd" < "$W/in" > "$W/ov.out" 2>&1
+$FRUN "$W/ref" < "$W/in" > "$W/ref.out" 2>&1
+YAMA_SIMD=0 $FRUN "$W/simd" < "$W/in" > "$W/ov.out" 2>&1
 if [ -s "$W/ref.out" ] && cmp -s "$W/ref.out" "$W/ov.out"; then echo "PASS yama fuzz override YAMA_SIMD=0"; else echo "FAIL yama fuzz override YAMA_SIMD=0"; fail=1; fi
 exit $fail

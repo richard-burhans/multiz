@@ -10,6 +10,7 @@
 #   tests/validate.sh sanitize                   gcc and clang ASan+UBSan builds: suite and deep merge, both dispatch paths
 #   tests/validate.sh sanitize-recover           the same, logging every report and continuing; zero reports from mz_yama.c required
 #   tests/validate.sh bounds                     the z3 bounds asserted (-DYAMA_ASSERT_BOUNDS) over every workload; PIECE03=1 adds piece 03
+#   tests/validate.sh cross                      static aarch64 build under qemu-aarch64: scalar fallback, no warnings, x86-identical output
 #
 # VW (default bench/data/tmp/simd_validate) holds the builds and logs. A sanitizer report makes the program exit
 # nonzero (halt_on_error, -fno-sanitize-recover), so a clean suite means zero reports. Leak detection is OFF under
@@ -205,6 +206,34 @@ bounds)
 		cells += v["cells"]; seen = 1 }
 		END { printf "BOUNDS extremes over %d processes: vmin=%.0f vmax=%.0f vmin_above_MININT=%.0f max|Izc|=%.0f max|eK|=%.0f cells=%.0f\n", NR, vmin, vmax, vmn, z, e, cells }' "$L"
 	echo "BOUNDS assertion or mismatch lines: $n"; [ "$n" = 0 ] || rc=1
+	exit $rc
+	;;
+cross)
+	# Non-x86 (bioconda builds linux-aarch64 and osx-arm64): a static aarch64 build run under qemu-aarch64.
+	# YAMA_SIMD must evaluate to 0 (the AVX2 code compiled out), mz_yama.c must compile warning-free, and the output
+	# must equal the x86 builds': tests/run.sh, check.sh, the fuzz digest and the deep-merge digest.
+	rc=0; X=aarch64-linux-gnu-gcc; Q=qemu-aarch64; n=x-aarch64
+	build $n $X "-O2 -static"
+	w=$(grep -c 'mz_yama\.c.*warning' "$VW/$n/.build.log" || true)
+	v=$(echo '#include "mz_yama.c"' | $X -O2 -dM -E -I"$T" -x c - 2> /dev/null | awk '$2 == "YAMA_SIMD" {print $3}')
+	echo "CROSS $n: mz_yama.c warnings $w; YAMA_SIMD=$v"; [ "$w" = 0 ] && [ "$v" = 0 ] || rc=1
+	b=$VW/$n.q; rm -rf "$b"; mkdir -p "$b"
+	for p in $PROGS; do printf '#!/bin/sh\nexec %s "%s/%s" "$@"\n' "$Q" "$VW/$n" "$p" > "$b/$p"; chmod +x "$b/$p"; done
+	r=0; sh "$T/tests/run.sh" "$b" > "$VW/$n/.suite.log" 2>&1 || r=$?
+	echo "CROSS run.sh: $(tail -1 "$VW/$n/.suite.log") rc=$r"; [ $r = 0 ] || rc=1
+	r=0; YAMA_FUZZ_CC=$X YAMA_FUZZ_CFLAGS="-O2 -static" YAMA_FUZZ_RUN=$Q sh "$T/tests/yama_fuzz/check.sh" "$VW/$n" \
+		> "$VW/$n/.fuzz.log" 2>&1 || r=$?
+	echo "CROSS check.sh: rc=$r $(grep -c '^PASS' "$VW/$n/.fuzz.log") PASS $(grep -c '^FAIL' "$VW/$n/.fuzz.log") FAIL"; [ $r = 0 ] || rc=1
+	f=$VW/$n/.yama_fuzz
+	$X -O2 -static -Wno-free-nonheap-object -I"$VW/$n" "$T/tests/yama_fuzz/main.c" "$VW/$n/mz_yama.c" "$VW/$n/mz_scores.c" \
+		"$VW/$n/util.c" -o "$f"
+	dg=$(for s in 11 12 13; do python3 "$T/tests/yama_fuzz/gen.py" $s 300 200 | $Q "$f"; done | sha256sum | cut -c1-16)
+	echo "CROSS fuzz digest $dg (x86 matrix: ${X86_FUZZ:-b3d5542704b57607})"; [ "$dg" = "${X86_FUZZ:-b3d5542704b57607}" ] || rc=1
+	o=$VW/$n/.deep; rm -rf "$o"; mkdir -p "$o"
+	$Q "$VW/$n/multiz" M=1 "$DEEP/left.maf" "$DEEP/right.maf" 0 "$o/U1.maf" "$o/U2.maf" > "$o/out.maf" 2> "$o/err" || rc=1
+	dd=$(cat "$o/out.maf" "$o/U1.maf" "$o/U2.maf" | grep -v '^#' | sha256sum | cut -c1-16)
+	echo "CROSS deep digest $dd (x86 matrix: ${X86_DEEP:-066d7c813aa8ed1c})"; [ "$dd" = "${X86_DEEP:-066d7c813aa8ed1c}" ] || rc=1
+	rm -f "$o"/*.maf
 	exit $rc
 	;;
 *) echo "unknown command $cmd" >&2; exit 2 ;;
