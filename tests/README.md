@@ -96,6 +96,13 @@ one range check at a time (`YAMA_FUZZ_GOP_IDX`), and the run-time override `YAMA
 seconds and needs python3 (it reports SKIP without it). On a CPU without AVX2 both builds run scalar, and it
 says so. `tests/yama_fuzz/run.sh` compares two trees instead (e.g. against a release).
 
+## CPUs without AVX2
+
+`tests/no_avx2.sh` (needs qemu-user and python3, about 20 s) runs the normal build under
+`qemu-x86_64 -cpu Westmere`, a CPU model without AVX2. It checks that yama's fuzz output matches a
+`-DYAMA_SIMD=0` build, that a `-DYAMA_SHADOW` build counts no vector rows there (and some under `-cpu Haswell`,
+as a positive control), and that the whole `tests/run.sh` suite passes with every program run that way.
+
 ## Not here
 
 The large-data checks need data that is not in the repository and are run
