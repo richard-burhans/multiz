@@ -1,6 +1,7 @@
 #!/bin/sh
 # Compare yama in two multiz trees on random cases:
 #   tests/yama_fuzz/run.sh BASE_TREE TEST_TREE WORKDIR [SEEDS] [NCASES] [MAXDIM] [CFLAGS]
+# YAMA_FUZZ_GOP in the environment rescales gap opens in both builds (see main.c).
 # Builds main.c against each tree's mz_yama.c and prints MATCH or DIFF per seed.
 set -eu
 H=$(cd "$(dirname "$0")" && pwd)
