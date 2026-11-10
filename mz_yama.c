@@ -183,6 +183,92 @@ static void cd_avx2(int lo, int hi, const score_t *pC, const score_t *pD,
         memcpy(fcd + col, &b, 4);	// little-endian: byte j is column col+j
     }
 }
+
+/* Pass 2 (I) for columns lo <= col < hi (hi - lo a multiple of 4) of a row
+*  below M, in the interior col >= LB[row]+2, where both of its guards hold.
+*  I is a running maximum, so it is found by a prefix scan in the (max,+)
+*  semiring, four columns at a time.  BEST3's value is max(x, y, z) whatever
+*  its tie order, so with m = max(x, y), e = vb[col][0]*K*gap_extend and
+*  Z = Izc[col]:
+*      I(col) = max(m, I(col-1) - Z) - e = max(a, I(col-1) + b),
+*  a = m - e, b = -(Z + e).  (a2,b2) o (a1,b1) = (max(a2, a1 + b2), b1 + b2)
+*  is associative, so a 2-step Hillis-Steele scan over the 4 lanes and the
+*  carried I(lo-1) give I for each lane exactly (integers, far from overflow:
+*  MININT is LLONG_MIN/4).  With I(col-1) known in every lane, BEST3 then runs
+*  as in the scalar code for the flags, and its value less e is I(col).
+*/
+#ifndef YAMA_SIMD_I
+#define YAMA_SIMD_I 1
+#endif
+#if YAMA_SIMD_I
+__attribute__((target("avx2")))
+static inline __m256i max_epi64(__m256i a, __m256i b) {
+    return _mm256_blendv_epi8(a, b, _mm256_cmpgt_epi64(b, a));
+}
+
+__attribute__((target("avx2")))
+static score_t i_avx2(int lo, int hi, const score_t *cC, const score_t *cD,
+                      score_t *cI, const uchar *fcd, uchar *tbp,
+                      const long long *cs, size_t stride, const score_t *Izc,
+                      const long long *eK, const row_tab *r, score_t Iin) {
+    const long long *g0 = cs, *g1 = cs + stride, *g2 = cs + 2*stride,
+                     *g3 = cs + 3*stride, *v0 = cs + 4*stride, *v1 = cs + 5*stride;
+    const __m256i Ix0 = _mm256_set1_epi64x(r->Ix[0]), Ix1 = _mm256_set1_epi64x(r->Ix[1]),
+                  Ix2 = _mm256_set1_epi64x(r->Ix[2]), Ix3 = _mm256_set1_epi64x(r->Ix[3]),
+                  Iy0 = _mm256_set1_epi64x(r->Iy[0]), Iy1 = _mm256_set1_epi64x(r->Iy[1]),
+                  NEG = _mm256_set1_epi64x(LLONG_MIN/2), ZERO = _mm256_setzero_si256();
+    __m256i carry = _mm256_set1_epi64x(Iin);
+    int col;
+
+    for (col = lo; col < hi; col += 4) {
+        __m256i G0 = _mm256_loadu_si256((const __m256i *)(g0 + col)),
+                G1 = _mm256_loadu_si256((const __m256i *)(g1 + col)),
+                G2 = _mm256_loadu_si256((const __m256i *)(g2 + col)),
+                G3 = _mm256_loadu_si256((const __m256i *)(g3 + col)),
+                V0 = _mm256_loadu_si256((const __m256i *)(v0 + col)),
+                V1 = _mm256_loadu_si256((const __m256i *)(v1 + col)),
+                Z = _mm256_loadu_si256((const __m256i *)(Izc + col)),
+                E = _mm256_loadu_si256((const __m256i *)(eK + col));
+        __m256i x, y, z, m, a, b, t, Ip, V, mi, md;
+        unsigned fb, fi;
+
+        x = _mm256_loadu_si256((const __m256i *)(cC + col - 1));
+        y = _mm256_loadu_si256((const __m256i *)(cD + col - 1));
+        t = _mm256_add_epi64(_mm256_add_epi64(_mm256_mul_epi32(G0, Ix0), _mm256_mul_epi32(G1, Ix1)),
+                             _mm256_add_epi64(_mm256_mul_epi32(G2, Ix2), _mm256_mul_epi32(G3, Ix3)));
+        x = _mm256_sub_epi64(x, t);
+        y = _mm256_sub_epi64(y, _mm256_add_epi64(_mm256_mul_epi32(V0, Iy0), _mm256_mul_epi32(V1, Iy1)));
+        m = max_epi64(x, y);
+        a = _mm256_sub_epi64(m, E);
+        b = _mm256_sub_epi64(ZERO, _mm256_add_epi64(Z, E));
+        // step 1: combine with the lane to the left
+        t = _mm256_blend_epi32(_mm256_permute4x64_epi64(a, 0x90), NEG, 0x03);
+        a = max_epi64(a, _mm256_add_epi64(t, b));
+        t = _mm256_blend_epi32(_mm256_permute4x64_epi64(b, 0x90), ZERO, 0x03);
+        b = _mm256_add_epi64(b, t);
+        // step 2: combine with the lane two to the left
+        t = _mm256_blend_epi32(_mm256_permute4x64_epi64(a, 0x40), NEG, 0x0F);
+        a = max_epi64(a, _mm256_add_epi64(t, b));
+        t = _mm256_blend_epi32(_mm256_permute4x64_epi64(b, 0x40), ZERO, 0x0F);
+        b = _mm256_add_epi64(b, t);
+        // apply the carried I(lo-1): a is now I for each lane
+        a = max_epi64(a, _mm256_add_epi64(carry, b));
+        // I(col-1) in each lane, then BEST3 exactly as the scalar code
+        Ip = _mm256_blend_epi32(_mm256_permute4x64_epi64(a, 0x90), carry, 0x03);
+        carry = _mm256_permute4x64_epi64(a, 0xFF);
+        z = _mm256_sub_epi64(Ip, Z);
+        BEST3_V(x, y, z, V, mi, md);
+        V = _mm256_sub_epi64(V, E);
+        _mm256_storeu_si256((__m256i *)(cI + col), V);
+        fi = SPREAD[_mm256_movemask_pd(_mm256_castsi256_pd(mi))]
+             | SPREAD[_mm256_movemask_pd(_mm256_castsi256_pd(md))] << 1;
+        memcpy(&fb, fcd + col, 4);
+        fb |= fi << 4;
+        memcpy(tbp + (col - lo), &fb, 4);
+    }
+    return cI[hi-1];
+}
+#endif
 #endif
 
 // populate a column from a column of height K and a column of height L
@@ -213,6 +299,9 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     int simd, vhi, *rowok = NULL;
     long long *cs = NULL;
     size_t stride = 0;
+#endif
+#if YAMA_SIMD && YAMA_SIMD_I
+    long long *eK = NULL;
 #endif
 
     if (LB[0] != 0 || RB[M] != N)
@@ -391,8 +480,21 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
                 ok &= FITS32(r->Cy[k]) & FITS32(r->Dx[k]) & FITS32(r->Dz[k]);
             for (k = 0; k < nsym; ++k)
                 ok &= FITS32(wA[(size_t)row*nsym + k]);
+#if YAMA_SIMD_I
+            for (k = 0; k < 4; ++k)
+                ok &= FITS32(r->Ix[k]);
+            for (k = 0; k < 2; ++k)
+                ok &= FITS32(r->Iy[k]);
+#endif
             rowok[row] = ok;
         }
+#if YAMA_SIMD_I
+        eK = ckalloc(stride*sizeof(long long));
+        for (col = 1; col <= N; ++col) {
+            n = vb[col][0];
+            eK[col] = n*K*gap_extend;	// the int product, as the scalar code
+        }
+#endif
     }
 #endif
 
@@ -477,7 +579,25 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
         flag_i = 0;	// unused
         cI[LB[row]] = I;
         *(tbp++) = fcd[LB[row]] | (flag_i << 4);
+        vlo = vend = -1;	// no vector segment
+#if YAMA_SIMD && YAMA_SIMD_I
+        if (simd && row < M && rowok[row]) {
+            vlo = LB[row] + 2;	// both guards below hold from here
+            vend = vlo + ((RB[row] - vlo + 1) & ~3);
+            if (vend <= vlo)
+                vlo = vend = -1;
+        }
+#endif
         for (col = LB[row] + 1; col <= RB[row]; ++col) {
+#if YAMA_SIMD && YAMA_SIMD_I
+            if (col == vlo) {
+                I = i_avx2(vlo, vend, cC, cD, cI, fcd, tbp, cs, stride, Izc,
+                           eK, rt + row, I);
+                tbp += vend - vlo;
+                if ((col = vend) > RB[row])
+                    break;
+            }
+#endif
             x = cC[col-1];
             y = cD[col-1];
             z = I;
@@ -595,6 +715,9 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
 #if YAMA_SIMD
     free(cs);
     free(rowok);
+#endif
+#if YAMA_SIMD && YAMA_SIMD_I
+    free(eK);
 #endif
     free(fcd);
     free(dashes);
