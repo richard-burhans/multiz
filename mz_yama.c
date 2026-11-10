@@ -69,7 +69,9 @@ row_tab;
 *  on any x86-64.  The kernel does the band's interior, where every guard of
 *  the scalar code is true; the edges stay scalar.  Its multiplies are exact
 *  32x32->64 products, so a row whose coefficients do not all fit in 32 bits
-*  is done by the scalar code.
+*  is done by the scalar code.  Setting YAMA_SIMD=0 in the environment forces
+*  the scalar path at run time (read once per process), for testing and as an
+*  escape hatch; the output is the same either way.
 */
 #ifndef YAMA_SIMD
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
@@ -546,7 +548,14 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
 #endif
 
 #if YAMA_SIMD
-    simd = __builtin_cpu_supports("avx2");
+    {   /* run-time choice: the CPU has AVX2 and YAMA_SIMD=0 is not set */
+        static int allowed = -1;
+        if (allowed < 0) {
+            const char *e = getenv("YAMA_SIMD");
+            allowed = !(e && e[0] == '0' && e[1] == '\0');
+        }
+        simd = allowed && __builtin_cpu_supports("avx2");
+    }
     if (simd) {
         stride = (size_t)N + 1;
         cs = ckalloc((6 + (size_t)nsym)*stride*sizeof(long long));
