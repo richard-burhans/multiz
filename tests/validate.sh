@@ -11,6 +11,7 @@
 #   tests/validate.sh sanitize-recover           the same, logging every report and continuing; zero reports from mz_yama.c required
 #   tests/validate.sh bounds                     the z3 bounds asserted (-DYAMA_ASSERT_BOUNDS) over every workload; PIECE03=1 adds piece 03
 #   tests/validate.sh cross                      static aarch64 build under qemu-aarch64: scalar fallback, no warnings, x86-identical output
+#   tests/validate.sh conda                      bioconda's typical CFLAGS (-march=nocona ...): identical output, AVX2 engages at run time
 #
 # VW (default bench/data/tmp/simd_validate) holds the builds and logs. A sanitizer report makes the program exit
 # nonzero (halt_on_error, -fno-sanitize-recover), so a clean suite means zero reports. Leak detection is OFF under
@@ -234,6 +235,26 @@ cross)
 	dd=$(cat "$o/out.maf" "$o/U1.maf" "$o/U2.maf" | grep -v '^#' | sha256sum | cut -c1-16)
 	echo "CROSS deep digest $dd (x86 matrix: ${X86_DEEP:-066d7c813aa8ed1c})"; [ "$dd" = "${X86_DEEP:-066d7c813aa8ed1c}" ] || rc=1
 	rm -f "$o"/*.maf
+	exit $rc
+	;;
+conda)
+	# Bioconda's typical x86-64 CFLAGS. -march=nocona has no AVX2, so this checks that the target("avx2") kernels
+	# still compile and, on AVX2 hardware, ENGAGE at run time (shadow mode counts the rows each kernel did), and that
+	# the output equals the matrix builds'.
+	rc=0; CF="-march=nocona -mtune=haswell -O2 -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -ffunction-sections -pipe"
+	build conda gcc "$CF"
+	w=$(grep -c 'mz_yama\.c.*warning' "$VW/conda/.build.log" || true); echo "CONDA mz_yama.c warnings: $w"; [ "$w" = 0 ] || rc=1
+	suite conda || rc=1
+	fuzzdig conda | tee "$VW/conda.fz"; fuzzdig conda YAMA_SIMD=0
+	deep conda | tee "$VW/conda.dp"
+	grep -q "${X86_FUZZ:-b3d5542704b57607}" "$VW/conda.fz" || rc=1; grep -q "${X86_DEEP:-066d7c813aa8ed1c}" "$VW/conda.dp" || rc=1
+	build conda-shadow gcc "$CF -DYAMA_SHADOW"
+	L=$VW/conda.shadow.log; rm -f "$L"
+	YAMA_SHADOW_LOG=$L "$VW/conda-shadow/multiz" M=1 "$DEEP/left.maf" "$DEEP/right.maf" 0 /dev/null /dev/null > /dev/null 2>&1 || rc=1
+	awk '/^YAMA_SHADOW calls/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] += kv[2] } }
+		END { printf "CONDA AVX2 engaged on the deep merge: p1_vec_rows=%d p2_vec_rows=%d of rows=%d (cells %d, vector p1 %d)\n", v["p1_vec_rows"], v["p2_vec_rows"], v["rows"], v["cells"], v["p1_vec_cells"] }' "$L" | tee "$VW/conda.eng"
+	awk '{ split($6, a, "="); exit !(a[2] > 0) }' "$VW/conda.eng" || rc=1
+	grep -q MISMATCH "$L" && rc=1
 	exit $rc
 	;;
 *) echo "unknown command $cmd" >&2; exit 2 ;;
