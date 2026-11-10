@@ -9,6 +9,7 @@
 #   tests/validate.sh matrix                     every CC x CFLAGS build: suite, fuzz digest, deep digest, all equal
 #   tests/validate.sh sanitize                   gcc and clang ASan+UBSan builds: suite and deep merge, both dispatch paths
 #   tests/validate.sh sanitize-recover           the same, logging every report and continuing; zero reports from mz_yama.c required
+#   tests/validate.sh bounds                     the z3 bounds asserted (-DYAMA_ASSERT_BOUNDS) over every workload; PIECE03=1 adds piece 03
 #
 # VW (default bench/data/tmp/simd_validate) holds the builds and logs. A sanitizer report makes the program exit
 # nonzero (halt_on_error, -fno-sanitize-recover), so a clean suite means zero reports. Leak detection is OFF under
@@ -160,6 +161,50 @@ sanitize-recover)
 		done
 	done 2>&1 | tee "$VW/sanitize_recover.log"
 	grep -q '^FAIL' "$VW/sanitize_recover.log" && rc=1
+	exit $rc
+	;;
+bounds)
+	# The z3 proof's value bounds, asserted (-DYAMA_ASSERT_BOUNDS, which also runs shadow mode) over every workload:
+	# tests/run.sh, the deep merge, every check.sh input set (random, 2^28 gap opens, single-entry tables, targeted,
+	# real calls) and, with PIECE03=1, hg38 100-way piece 03. Alignments (stdout) must equal a plain scalar build;
+	# shadow mode's counters go to stderr and differ by design. Prints the observed extremes.
+	rc=0; F=$T/tests/yama_fuzz; L=$VW/bounds.shadow.log; rm -f "$L"
+	build ab gcc "-O2 -DYAMA_ASSERT_BOUNDS"
+	export YAMA_SHADOW_LOG=$L
+	gcc -O2 -Wno-free-nonheap-object -DYAMA_ASSERT_BOUNDS -I"$T" "$F/main.c" "$T/mz_yama.c" "$T/mz_scores.c" "$T/util.c" -o "$VW/ab.fz"
+	gcc -O2 -Wno-free-nonheap-object -DYAMA_SIMD=0 -I"$T" "$F/main.c" "$T/mz_yama.c" "$T/mz_scores.c" "$T/util.c" -o "$VW/ref.fz"
+	r=0; sh "$T/tests/run.sh" "$VW/ab" > "$VW/ab/.suite.log" 2>&1 || r=$?
+	echo "BOUNDS run.sh: $(tail -1 "$VW/ab/.suite.log") rc=$r"; [ $r = 0 ] || rc=1
+	deep ab || rc=1
+	fz() { # LABEL GENARGS... -- ENV...
+		local label=$1; shift; local ga=(); while [ "$1" != -- ]; do ga+=("$1"); shift; done; shift
+		if [ "${ga[0]}" = real ]; then cp "$F/real_cases.txt" "$VW/b.in"; else python3 "$F/gen.py" "${ga[@]}" > "$VW/b.in"; fi
+		local a=0; env "$@" "$VW/ab.fz" < "$VW/b.in" > "$VW/b.ab" 2> /dev/null || a=$?
+		env "$@" "$VW/ref.fz" < "$VW/b.in" > "$VW/b.ref" 2> /dev/null
+		if [ $a = 0 ] && cmp -s "$VW/b.ab" "$VW/b.ref"; then echo "BOUNDS fuzz $label: ok"; else echo "BOUNDS fuzz $label: FAIL rc=$a"; rc=1; fi
+	}
+	G=268435456
+	for s in 1 2 3; do fz "random $s" $s 300 200 --; done
+	for s in 301 302; do fz "gop2^28 $s" $s 300 200 -- YAMA_FUZZ_GOP=$G; done
+	for ix in 2 0 8; do fz "gop_idx $ix" 401 300 200 -- YAMA_FUZZ_GOP=$G YAMA_FUZZ_GOP_IDX=$ix; done
+	for m in narrow ties edges; do fz "targeted $m" 501 300 200 $m --; done
+	fz "real cases" real --
+	if [ "${PIECE03:-0}" = 1 ]; then
+		P=${PIECE:-/home/rcb112/project/claude/bench/repos/cannabis-genome/scripts/ucsc100way_run_piece.sh}
+		U=${U:-/home/rcb112/project/claude/bench/data/ucsc100way}
+		rm -rf "$VW/ab.piece"; bash "$P" "$VW/ab" "$U/run03/inputs-v3" "$U/tree.nh" "$VW/ab.piece" > /dev/null 2>&1 || true
+		dg=$(grep -v '^#' "$VW/ab.piece/out.maf" 2> /dev/null | sha256sum | cut -c1-64)
+		echo "BOUNDS piece03 digest $dg (expected 39a97134f419b0b478edd4c7687849132391f997e0b297a4dedaa7ad3330176b)"
+		[ "$dg" = 39a97134f419b0b478edd4c7687849132391f997e0b297a4dedaa7ad3330176b ] || rc=1
+	fi
+	n=$(grep -c 'YAMA_ASSERT_BOUNDS\|MISMATCH' "$L" 2> /dev/null || true)
+	awk '/^YAMA_SHADOW calls/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+		if (!seen || v["vmin"] + 0 < vmin) vmin = v["vmin"] + 0; if (!seen || v["vmax"] + 0 > vmax) vmax = v["vmax"] + 0
+		if (v["vmin_above_MININT"] + 0 < vmn || !seen) vmn = v["vmin_above_MININT"] + 0
+		if (v["max_abs_Izc"] + 0 > z) z = v["max_abs_Izc"] + 0; if (v["max_abs_eK"] + 0 > e) e = v["max_abs_eK"] + 0
+		cells += v["cells"]; seen = 1 }
+		END { printf "BOUNDS extremes over %d processes: vmin=%.0f vmax=%.0f vmin_above_MININT=%.0f max|Izc|=%.0f max|eK|=%.0f cells=%.0f\n", NR, vmin, vmax, vmn, z, e, cells }' "$L"
+	echo "BOUNDS assertion or mismatch lines: $n"; [ "$n" = 0 ] || rc=1
 	exit $rc
 	;;
 *) echo "unknown command $cmd" >&2; exit 2 ;;
