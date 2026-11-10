@@ -34,6 +34,19 @@ typedef long long score_t;
 // MININT is a hugely negative number away from the underflow threshold
 #define MININT (LLONG_MIN/4)
 
+/* YAMA_ASSERT_BOUNDS (test build): abort if a value leaves the bounds the z3 proof of the I-pass scan assumes
+*  (tests/simd_proof/scan_z3.py): stored C, D, I values in [VLO, VHI] = [-2^62 + 2^47, 2^62 - 2^47], |Izc| <= 2^44,
+*  and eK = n*K*gap_extend within int.  It is checked where shadow mode already visits every value, so it implies
+*  YAMA_SHADOW (each row is also compared cell by cell with the scalar code). */
+#ifdef YAMA_ASSERT_BOUNDS
+#ifndef YAMA_SHADOW
+#define YAMA_SHADOW 1
+#endif
+#define YAMA_VHI ((1LL << 62) - (1LL << 47))
+#define YAMA_VLO (-YAMA_VHI)
+#define YAMA_ZMAX (1LL << 44)
+#endif
+
 /* Column counts.  Every per-cell sum in yama() runs over all K*L row pairs, but a
 *  row of A enters a sum only through its symbol and whether it and the row
 *  before it are dashes, and likewise a row of B.  So each sum is built from
@@ -306,7 +319,16 @@ static void sh_report(void) {
     if (f)
         fclose(f);
 }
+static void sh_report(void);
 static void sh_val(score_t v) {
+#ifdef YAMA_ASSERT_BOUNDS
+    if (v < YAMA_VLO || v > YAMA_VHI) {
+        fprintf(stderr, "YAMA_ASSERT_BOUNDS value %lld outside [%lld, %lld]\n", (long long)v,
+                (long long)YAMA_VLO, (long long)YAMA_VHI);
+        sh_report();
+        abort();
+    }
+#endif
     if (v < sh_vmin) sh_vmin = v;
     if (v > sh_vmax) sh_vmax = v;
     if (v > MININT && v < sh_vmin_nonsentinel) sh_vmin_nonsentinel = v;
@@ -541,9 +563,17 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
         sV = Izc[col] < 0 ? -Izc[col] : Izc[col];
         if (sV > sh_zmax) sh_zmax = sV;
         n = vb[col][0];
-        sV = n*K*gap_extend;
+        sV = (score_t)n*K*gap_extend;   /* in 64 bits, so an int overflow is seen, not committed */
         if (sV < 0) sV = -sV;
         if (sV > sh_emax) sh_emax = sV;
+#ifdef YAMA_ASSERT_BOUNDS
+        if (sh_zmax > YAMA_ZMAX || sh_emax > INT_MAX) {
+            fprintf(stderr, "YAMA_ASSERT_BOUNDS |Izc| %lld (max %lld) or |eK| %lld (max %d) out of bounds\n",
+                    (long long)sh_zmax, (long long)YAMA_ZMAX, (long long)sh_emax, INT_MAX);
+            sh_report();
+            abort();
+        }
+#endif
     }
 #endif
 
