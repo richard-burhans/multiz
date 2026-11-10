@@ -62,6 +62,129 @@ typedef struct ROWTAB {
 }
 row_tab;
 
+/* Row-parallel SIMD for pass 1 (C and D, which read only the previous row).
+*  YAMA_SIMD=0 at compile time keeps the scalar path only; otherwise, on x86-64
+*  with GCC or Clang, an AVX2 kernel is compiled with a target attribute and
+*  chosen at run time when the CPU has AVX2, so the default build still runs
+*  on any x86-64.  The kernel does the band's interior, where every guard of
+*  the scalar code is true; the edges stay scalar.  Its multiplies are exact
+*  32x32->64 products, so a row whose coefficients do not all fit in 32 bits
+*  is done by the scalar code.
+*/
+#ifndef YAMA_SIMD
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define YAMA_SIMD 1
+#else
+#define YAMA_SIMD 0
+#endif
+#endif
+
+#if YAMA_SIMD
+#include <immintrin.h>
+#include <string.h>
+
+// SPREAD[m] puts bit j of the 4-bit mask m into bit 0 of byte j
+static const unsigned SPREAD[16] = {
+    0x00000000, 0x00000001, 0x00000100, 0x00000101,
+    0x00010000, 0x00010001, 0x00010100, 0x00010101,
+    0x01000000, 0x01000001, 0x01000100, 0x01000101,
+    0x01010000, 0x01010001, 0x01010100, 0x01010101
+};
+
+#ifndef FITS32	// overridable, to test the scalar fallback
+#define FITS32(v) ((v) >= INT_MIN && (v) <= INT_MAX)
+#endif
+
+/* BEST3 on 4 lanes: V is the winner, mi and md flag lanes won by z (I) and
+*  y (D), so the 2-bit flag is FLAG_I*mi | FLAG_D*md, exactly as BEST3.
+*/
+#define BEST3_V(x, y, z, V, mi, md) do { \
+        __m256i bx_ = _mm256_or_si256(_mm256_cmpgt_epi64(y, x), _mm256_cmpgt_epi64(z, x)); \
+        /* bx_ is NOT (x >= y && x >= z) */ \
+        md = _mm256_and_si256(bx_, _mm256_cmpgt_epi64(y, z)); \
+        mi = _mm256_andnot_si256(md, bx_); \
+        V = _mm256_blendv_epi8(_mm256_blendv_epi8(x, y, md), z, mi); \
+    } while (0)
+
+/* Columns lo <= col < hi (hi - lo a multiple of 4) of pass 1 for one row in
+*  the band's interior: row > 1, col >= 2, col < N, col >= LB[row-1]+2 and
+*  col >= LB[row-2]+2.  cs holds per-column int64 copies of gb[.][0..3],
+*  vb[.][0..1] and hist[.][0..nsym-1], each stride long.
+*/
+__attribute__((target("avx2")))
+static void cd_avx2(int lo, int hi, const score_t *pC, const score_t *pD,
+                    const score_t *pI, score_t *cC, score_t *cD, uchar *fcd,
+                    const long long *cs, size_t stride, int nsym,
+                    const row_tab *r, const score_t *w, score_t dge) {
+    const long long *g0 = cs, *g1 = cs + stride, *g2 = cs + 2*stride,
+                     *g3 = cs + 3*stride, *v0 = cs + 4*stride, *v1 = cs + 5*stride,
+                      *h = cs + 6*stride;
+    __m256i Cx0 = _mm256_set1_epi64x(r->Cx[0]), Cx1 = _mm256_set1_epi64x(r->Cx[1]),
+            Cx2 = _mm256_set1_epi64x(r->Cx[2]), Cx3 = _mm256_set1_epi64x(r->Cx[3]),
+            Cz0 = _mm256_set1_epi64x(r->Cz[0]), Cz1 = _mm256_set1_epi64x(r->Cz[1]),
+            Cz2 = _mm256_set1_epi64x(r->Cz[2]), Cz3 = _mm256_set1_epi64x(r->Cz[3]),
+            Cy0 = _mm256_set1_epi64x(r->Cy[0]), Cy1 = _mm256_set1_epi64x(r->Cy[1]),
+            Dx0 = _mm256_set1_epi64x(r->Dx[0]), Dx1 = _mm256_set1_epi64x(r->Dx[1]),
+            Dz0 = _mm256_set1_epi64x(r->Dz[0]), Dz1 = _mm256_set1_epi64x(r->Dz[1]),
+            Dy = _mm256_set1_epi64x(r->Dy), Dge = _mm256_set1_epi64x(dge);
+    __m256i W[16];
+    int col, k, nw = nsym < 16 ? nsym : 16;
+
+    for (k = 0; k < nw; ++k)
+        W[k] = _mm256_set1_epi64x(w[k]);
+    for (col = lo; col < hi; col += 4) {
+        __m256i G0 = _mm256_loadu_si256((const __m256i *)(g0 + col)),
+                G1 = _mm256_loadu_si256((const __m256i *)(g1 + col)),
+                G2 = _mm256_loadu_si256((const __m256i *)(g2 + col)),
+                G3 = _mm256_loadu_si256((const __m256i *)(g3 + col)),
+                V0 = _mm256_loadu_si256((const __m256i *)(v0 + col)),
+                V1 = _mm256_loadu_si256((const __m256i *)(v1 + col));
+        __m256i x, y, z, Cv, Dv, ic, dc, id, dd, t;
+        unsigned b;
+
+        // C from (row-1,col-1)
+        x = _mm256_loadu_si256((const __m256i *)(pC + col - 1));
+        y = _mm256_loadu_si256((const __m256i *)(pD + col - 1));
+        z = _mm256_loadu_si256((const __m256i *)(pI + col - 1));
+        t = _mm256_add_epi64(_mm256_add_epi64(_mm256_mul_epi32(G0, Cx0), _mm256_mul_epi32(G1, Cx1)),
+                             _mm256_add_epi64(_mm256_mul_epi32(G2, Cx2), _mm256_mul_epi32(G3, Cx3)));
+        x = _mm256_sub_epi64(x, t);
+        t = _mm256_add_epi64(_mm256_add_epi64(_mm256_mul_epi32(G0, Cz0), _mm256_mul_epi32(G1, Cz1)),
+                             _mm256_add_epi64(_mm256_mul_epi32(G2, Cz2), _mm256_mul_epi32(G3, Cz3)));
+        z = _mm256_sub_epi64(z, t);
+        t = _mm256_add_epi64(_mm256_mul_epi32(V0, Cy0), _mm256_mul_epi32(V1, Cy1));
+        y = _mm256_sub_epi64(y, t);
+        BEST3_V(x, y, z, Cv, ic, dc);
+        for (k = 0; k < nw; ++k)
+            Cv = _mm256_add_epi64(Cv, _mm256_mul_epi32(
+                     _mm256_loadu_si256((const __m256i *)(h + k*stride + col)), W[k]));
+        for ( ; k < nsym; ++k)
+            Cv = _mm256_add_epi64(Cv, _mm256_mul_epi32(
+                     _mm256_loadu_si256((const __m256i *)(h + k*stride + col)),
+                     _mm256_set1_epi64x(w[k])));
+
+        // D from (row-1,col)
+        x = _mm256_loadu_si256((const __m256i *)(pC + col));
+        y = _mm256_loadu_si256((const __m256i *)(pD + col));
+        z = _mm256_loadu_si256((const __m256i *)(pI + col));
+        x = _mm256_sub_epi64(x, _mm256_add_epi64(_mm256_mul_epi32(V0, Dx0), _mm256_mul_epi32(V1, Dx1)));
+        y = _mm256_sub_epi64(y, Dy);
+        z = _mm256_sub_epi64(z, _mm256_add_epi64(_mm256_mul_epi32(V0, Dz0), _mm256_mul_epi32(V1, Dz1)));
+        BEST3_V(x, y, z, Dv, id, dd);
+        Dv = _mm256_sub_epi64(Dv, Dge);
+
+        _mm256_storeu_si256((__m256i *)(cC + col), Cv);
+        _mm256_storeu_si256((__m256i *)(cD + col), Dv);
+        // fcd = flag_c | flag_d<<2, with FLAG_I = 1 and FLAG_D = 2
+        b = SPREAD[_mm256_movemask_pd(_mm256_castsi256_pd(ic))]
+            | SPREAD[_mm256_movemask_pd(_mm256_castsi256_pd(dc))] << 1
+            | SPREAD[_mm256_movemask_pd(_mm256_castsi256_pd(id))] << 2
+            | SPREAD[_mm256_movemask_pd(_mm256_castsi256_pd(dd))] << 3;
+        memcpy(fcd + col, &b, 4);	// little-endian: byte j is column col+j
+    }
+}
+#endif
+
 // populate a column from a column of height K and a column of height L
 static void new_col(uchar *from1, int K, uchar *from2, int L, uchar *to_col) {
     //void new_col(uchar *from1, int K, uchar *from2, int L, uchar *to_col) {
@@ -85,6 +208,12 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     uchar **tback_row, *tback, *tbp, st, flag_d, flag_i, flag_c, node,
     *dashes, *script, **al_new, *fcd;
     score_t *dpbuf, *pC, *pD, *pI, *cC, *cD, *cI, *sw;
+    int vlo, vend;
+#if YAMA_SIMD
+    int simd, vhi, *rowok = NULL;
+    long long *cs = NULL;
+    size_t stride = 0;
+#endif
 
     if (LB[0] != 0 || RB[M] != N)
         fatalf("LB and RB not terminated properly: %d %d %d", LB[0], RB[M], N);
@@ -239,6 +368,34 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     for (col = 1; col <= N; ++col)
         Izc[col] = DOT4(gb[col], Iz);
 
+#if YAMA_SIMD
+    simd = __builtin_cpu_supports("avx2");
+    if (simd) {
+        stride = (size_t)N + 1;
+        cs = ckalloc((6 + (size_t)nsym)*stride*sizeof(long long));
+        for (col = 1; col <= N; ++col) {
+            for (k = 0; k < 4; ++k)
+                cs[k*stride + col] = gb[col][k];
+            cs[4*stride + col] = vb[col][0];
+            cs[5*stride + col] = vb[col][1];
+            for (k = 0; k < nsym; ++k)
+                cs[(6 + k)*stride + col] = hist[(size_t)col*nsym + k];
+        }
+        rowok = ckalloc((M+1)*sizeof(int));
+        for (row = 1; row <= M; ++row) {
+            row_tab *r = rt + row;
+            int ok = 1;
+            for (k = 0; k < 4; ++k)
+                ok &= FITS32(r->Cx[k]) & FITS32(r->Cz[k]);
+            for (k = 0; k < 2; ++k)
+                ok &= FITS32(r->Cy[k]) & FITS32(r->Dx[k]) & FITS32(r->Dz[k]);
+            for (k = 0; k < nsym; ++k)
+                ok &= FITS32(wA[(size_t)row*nsym + k]);
+            rowok[row] = ok;
+        }
+    }
+#endif
+
     C = D = I = MININT;
     for (row = 1; row <= M; ++row) {
         tback_row[row] = tbp - LB[row];
@@ -247,7 +404,27 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
         *  (row-1,col-1) and D(row,col) only (row-1,col), so the columns are
         *  independent.
         */
+        vlo = vend = -1;	// no vector segment
+#if YAMA_SIMD
+        if (simd && row > 1 && rowok[row]) {
+            // the interior, where every guard below is true
+            vlo = MAX(MAX(LB[row], 2), MAX(LB[row-1], LB[row-2]) + 2);
+            vhi = MIN(RB[row], N-1);
+            vend = vlo + ((vhi - vlo + 1) & ~3);
+            if (vend <= vlo)
+                vlo = vend = -1;
+        }
+#endif
         for (col = LB[row]; col <= RB[row]; ++col) {
+#if YAMA_SIMD
+            if (col == vlo) {
+                n = ua[row][0];
+                cd_avx2(vlo, vend, pC, pD, pI, cC, cD, fcd, cs, stride, nsym,
+                        rt + row, wA + (size_t)row*nsym, (score_t)(n*L*gap_extend));
+                if ((col = vend) > RB[row])
+                    break;
+            }
+#endif
             // compute C and flag_c from (row-1,col-1)
             if (col > LB[row-1]) {
                 x = pC[col-1];
@@ -415,6 +592,10 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     free(tback_row);
     free(tback);
     free(dpbuf);
+#if YAMA_SIMD
+    free(cs);
+    free(rowok);
+#endif
     free(fcd);
     free(dashes);
     free(script);
