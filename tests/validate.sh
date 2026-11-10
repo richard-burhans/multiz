@@ -8,6 +8,7 @@
 #   tests/validate.sh valgrind NAME              memcheck on tests/run.sh (every program wrapped) and on the deep merge
 #   tests/validate.sh matrix                     every CC x CFLAGS build: suite, fuzz digest, deep digest, all equal
 #   tests/validate.sh sanitize                   gcc and clang ASan+UBSan builds: suite and deep merge, both dispatch paths
+#   tests/validate.sh sanitize-recover           the same, logging every report and continuing; zero reports from mz_yama.c required
 #
 # VW (default bench/data/tmp/simd_validate) holds the builds and logs. A sanitizer report makes the program exit
 # nonzero (halt_on_error, -fno-sanitize-recover), so a clean suite means zero reports. Leak detection is OFF under
@@ -130,6 +131,35 @@ sanitize)
 		deep "san-$c" YAMA_SIMD=0 || rc=1
 	done 2>&1 | tee "$VW/sanitize.log"
 	grep -q 'FAILED\|rc=[1-9]\|fuzz_rc=[1-9]' "$VW/sanitize.log" && rc=1
+	exit $rc
+	;;
+sanitize-recover)
+	# Like `sanitize`, but every report is logged and execution continues, so one pre-existing error elsewhere
+	# (mz_preyama.c reads map4[-1]; see simd_row_prototype.md) cannot hide later ones. Each report is attributed to
+	# its first frame in this tree; the requirement is ZERO reports from mz_yama.c, on both dispatch paths.
+	rc=0
+	command -v llvm-symbolizer > /dev/null && export ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer)
+	for c in gcc clang; do
+		n=sanr-$c
+		build "$n" "$c" "-O1 -fsanitize=address,undefined -fsanitize-recover=all -fno-omit-frame-pointer -g"
+		for mode in simd scalar; do
+			envs=(); [ $mode = scalar ] && envs=(YAMA_SIMD=0)
+			L=$VW/$n/.san.$mode; rm -rf "$L"; mkdir -p "$L"
+			export ASAN_OPTIONS="detect_leaks=0:halt_on_error=0:log_path=$L/asan"
+			export UBSAN_OPTIONS="halt_on_error=0:print_stacktrace=1:log_path=$L/ubsan"
+			suite "$n" "${envs[@]}" || true
+			deep "$n" "${envs[@]}" || true
+			# tally: the first "#k ... in FUNC FILE:LINE" frame whose FILE is in the build tree, per report
+			awk -v root="$VW/$n/" '
+				/ERROR: AddressSanitizer|runtime error/ { want = 1; kind = ($0 ~ /runtime error/) ? "ubsan" : "asan"
+					if (kind == "ubsan") { split($1, a, ":"); f = a[1]; sub(root, "", f); if (f != "") { print kind, f ":" a[2]; want = 0 } } next }
+				want && /^ *#[0-9]+ / && index($0, root) { for (i = 1; i <= NF; i++) if (index($i, root)) { f = $i; sub(root, "", f); sub(/:[0-9]+$/, "", f); print kind, f; want = 0; break } }
+			' "$L"/* 2> /dev/null | sort | uniq -c | sort -rn > "$L/tally"
+			echo "TALLY $n $mode: $(awk '{printf "%s %s x%d; ", $2, $3, $1}' "$L/tally")"
+			grep -q 'mz_yama\.c' "$L/tally" && { echo "FAIL $n $mode: a report from mz_yama.c"; rc=1; }
+		done
+	done 2>&1 | tee "$VW/sanitize_recover.log"
+	grep -q '^FAIL' "$VW/sanitize_recover.log" && rc=1
 	exit $rc
 	;;
 *) echo "unknown command $cmd" >&2; exit 2 ;;
