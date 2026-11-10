@@ -14,9 +14,22 @@ int main(void) {
     init_scores70();
     {   /* YAMA_FUZZ_GOP=n replaces every nonzero gap-open entry with n, so with
         *  n near 2^28 the per-row coefficients pass 32 bits and yama must take
-        *  its scalar fallback (FITS32) on those rows. */
-        const char *g = getenv("YAMA_FUZZ_GOP");
-        if (g)
+        *  its scalar fallback (FITS32) on those rows.  YAMA_FUZZ_GOP_IDX="i,j"
+        *  sets only gop[i], gop[j] (zero or not) to n instead.  Under the
+        *  shipped table every FITS32 check is implied by another (all nonzero
+        *  entries are equal), so a lone check can only be tested with a table
+        *  multiz never builds: index 2, GAP(0,0,1,0), enlarges only Ix on rows
+        *  of A without dashes; 0 only Cx; 8 only Cx and Cz. */
+        const char *g = getenv("YAMA_FUZZ_GOP"), *gi = getenv("YAMA_FUZZ_GOP_IDX");
+        if (g && gi) {
+            char *e;
+            for (const char *q = gi; *q; q = *e ? e + 1 : e) {
+                long ix = strtol(q, &e, 10);
+                if (e == q || ix < 0 || ix > 15)
+                    fatalf("bad YAMA_FUZZ_GOP_IDX %s", gi);
+                gop[ix] = atoi(g);
+            }
+        } else if (g)
             for (i = 0; i < 16; i++)
                 if (gop[i])
                     gop[i] = atoi(g);
