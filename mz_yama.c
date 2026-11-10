@@ -656,6 +656,9 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
         *  independent.
         */
         vlo = vend = -1;	// no vector segment
+#if !YAMA_SIMD
+        (void)vlo; (void)vend;	// read only by the vector and shadow code; keeps scalar builds warning-free
+#endif
 #if YAMA_SIMD
         if (simd && row > 1 && rowok[row]) {
             // the interior, where every guard below is true
