@@ -616,6 +616,10 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
                 cs[(6 + k)*stride + col] = hist[(size_t)col*nsym + k];
         }
         rowok = ckalloc((M+1)*sizeof(int));
+        /* Under the shipped gap table every nonzero gap-open entry is equal, so the Cx, Cz and Ix checks are implied
+        *  by the Cy, Dx, Dz and Iy checks: tests/simd_mutation/real_table_checks.sh removes them at every magnitude
+        *  of a real-shaped table and the output never changes. They stay, at one comparison per row, so a future
+        *  configurable gap table cannot reach the 32-bit multiplies unchecked. */
         for (row = 1; row <= M; ++row) {
             row_tab *r = rt + row;
             int ok = 1;
