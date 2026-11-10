@@ -19,8 +19,12 @@ W=$(mktemp -d "${TMPDIR:-/tmp}/yama-fuzz.XXXXXX") || exit 2
 trap 'rm -rf "$W"' EXIT
 trap 'exit 2' HUP INT TERM
 GOP=268435456
+# YAMA_FUZZ_CC and YAMA_FUZZ_CFLAGS (default gcc, -O2) choose the compiler and flags for both builds, so the
+# sanitizer and compiler-matrix runs (tests/validate.sh) cover this check too.
+FCC=${YAMA_FUZZ_CC:-gcc}
+FCFLAGS=${YAMA_FUZZ_CFLAGS:--O2}
 build() {
-	gcc -O2 -Wno-free-nonheap-object $2 -I"$T" "$H/main.c" "$T/mz_yama.c" "$T/mz_scores.c" "$T/util.c" \
+	$FCC $FCFLAGS -Wno-free-nonheap-object $2 -I"$T" "$H/main.c" "$T/mz_yama.c" "$T/mz_scores.c" "$T/util.c" \
 		-o "$W/$1" || { echo "FAIL yama fuzz: cannot build $1"; exit 1; }
 }
 build ref -DYAMA_SIMD=0
