@@ -34,12 +34,6 @@ typedef long long score_t;
 // MININT is a hugely negative number away from the underflow threshold
 #define MININT (LLONG_MIN/4)
 
-/* Dynamic Programming structure. */
-typedef struct DP {
-    score_t D, C, I;
-}
-dp_node;
-
 /* Column counts.  Every per-cell sum in yama() runs over all K*L row pairs, but a
 *  row of A enters a sum only through its symbol and whether it and the row
 *  before it are dashes, and likewise a row of B.  So each sum is built from
@@ -83,14 +77,14 @@ static void new_col(uchar *from1, int K, uchar *from2, int L, uchar *to_col) {
 void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
           uchar ***OAL, int *OM) {
     int i, j, k, m, m_new, n, row, col, s, t, u, v, nedit, nsym, c;
-    score_t C, D, I, x, y, z, diag_c, diag_d, diag_i, Iz[4];
+    score_t C, D, I, x, y, z, Iz[4];
     int (*gb)[4], (*vb)[2], (*cnt)[4], (*ua)[2], *hist, sym[256], sym_ix[256];
     score_t *wA, *Izc;
     row_tab *rt;
     size_t tback_size;    // sum of band widths; can exceed INT_MAX for long insertions
     uchar **tback_row, *tback, *tbp, st, flag_d, flag_i, flag_c, node,
-    *dashes, *script, **al_new;
-    dp_node *dp;
+    *dashes, *script, **al_new, *fcd;
+    score_t *dpbuf, *pC, *pD, *pI, *cC, *cD, *cI, *sw;
 
     if (LB[0] != 0 || RB[M] != N)
         fatalf("LB and RB not terminated properly: %d %d %d", LB[0], RB[M], N);
@@ -116,19 +110,32 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     tbp = tback_row[0] = tback;
     *(tbp++) = 0;	/* unused */
 
-    dp = ckalloc((N+1)*sizeof(dp_node));
-    dp[0].C = dp[0].D = dp[0].I = 0;
+    /* Two DP rows, previous (p) and current (c), stored as separate C, D and
+    *  I arrays.  Columns of p beyond the previous row's band are never written
+    *  by any row (RB is monotonic), so they hold MININT as the single in-place
+    *  row did; columns below the band are never read.
+    */
+    pC = dpbuf = ckalloc(6*(size_t)(N+1)*sizeof(score_t));
+    pD = pC + (N+1);
+    pI = pD + (N+1);
+    cC = pI + (N+1);
+    cD = cC + (N+1);
+    cI = cD + (N+1);
+    fcd = ckalloc((N+1)*sizeof(uchar));
+    for (col = 0; col <= N; ++col)
+        cC[col] = cD[col] = cI[col] = MININT;
+    pC[0] = pD[0] = pI[0] = 0;
     flag_i = FLAG_I;
     for (col = 1; col <= RB[0]; ++col) {
-        dp[col].C = dp[col].D = MININT;
+        pC[col] = pD[col] = MININT;
         for (j = n = 0; j < L; ++j)
             if (B[col][j] != '-')
                 ++n;
-        dp[col].I = dp[col-1].I - n*K*gap_extend;
+        pI[col] = pI[col-1] - n*K*gap_extend;
         *(tbp++) = (flag_i << 4);
     }
     for ( ; col <= N; ++col)
-        dp[col].C = dp[col].D = dp[col].I = MININT;
+        pC[col] = pD[col] = pI[col] = MININT;
 
     /* B side: for column col, gb counts rows by (B[col-1] is '-', B[col] is
     *  '-'), vb by B[col] alone, and hist counts each symbol.
@@ -236,57 +243,16 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     for (row = 1; row <= M; ++row) {
         tback_row[row] = tbp - LB[row];
 
-        col = LB[row] - 1;
-        if (LB[row-1] <= col) {
-            diag_c = dp[col].C;
-            diag_d = dp[col].D;
-            diag_i = dp[col].I;
-        } else
-            diag_c = diag_d = diag_i = MININT;
-
-        C = D = I = MININT;
-        while (++col <= RB[row]) {
-            // C, D, and I values are for the previous column
-            // diag_c, diag_d and diag_i are for (row-1,col-1)
-
-            // compute I and flag_i
-            if (col > LB[row]) {
-                x = C;
-                y = D;
-                z = I;
-                /* The main complexity is for the quasi-natural
-                *  gap costs, which depend on the types (C,D,I)
-                *  of the last two edges in a path, i.e., on
-                *  the types of the last two nodes.
-                */
-                if (row < M) {	// not for end-gaps
-                    if (col > LB[row-1]+1)
-                        x -= DOT4(gb[col], rt[row].Ix);
-                    if (col > LB[row]+1)
-                        z -= Izc[col];
-                    y -= vb[col][0]*rt[row].Iy[0] + vb[col][1]*rt[row].Iy[1];
-                }
-                /* Precede the insertion edge with a substitution edge
-                *  (from the C node at (row-1,col)) if that is best,
-                *  else with a deletion edge, else with an insertion.
-                */
-                BEST3(x, y, z, I, flag_i);
-                /* Each of n non-dashes in the inserted column
-                * is aligned to K dashes.
-                */
-                n = vb[col][0];	// non-dashes in the inserted column
-                I -= n*K*gap_extend;
-
-            } else {
-                I = MININT;
-                flag_i = 0;	// unused
-            }
-
-            // compute C and flag_c
+        /* Pass 1: C and D for every column of the band.  C(row,col) reads only
+        *  (row-1,col-1) and D(row,col) only (row-1,col), so the columns are
+        *  independent.
+        */
+        for (col = LB[row]; col <= RB[row]; ++col) {
+            // compute C and flag_c from (row-1,col-1)
             if (col > LB[row-1]) {
-                x = diag_c;
-                y = diag_d;
-                z = diag_i;
+                x = pC[col-1];
+                y = pD[col-1];
+                z = pI[col-1];
                 if (col > 1) {	// no gap-open penalty at start
                     if (row > 1 && col > LB[row-2] + 1)
                         x -= DOT4(gb[col], rt[row].Cx);
@@ -303,10 +269,10 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
                 flag_c = 0;
             }
 
-            // compute D and flag_d
-            x = dp[col].C;
-            y = dp[col].D;
-            z = dp[col].I;
+            // compute D and flag_d from (row-1,col)
+            x = pC[col];
+            y = pD[col];
+            z = pI[col];
             if (0 < col && col < N) {	// not for end-gaps
                 // here v is 1 and t is B[col]'s own dash flag
                 if (row > 1 && col > LB[row-2])
@@ -319,23 +285,67 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
             BEST3(x, y, z, D, flag_d);
             // Each of n non-dashes in the deleted column
             // is aligned to L dashes.
-
             n = ua[row][0];	// non-dashes in the deleted column
             D -= n*L*gap_extend;
 
-            // complete processing of the grid point (row,col)
-            diag_c = dp[col].C;
-            diag_d = dp[col].D;
-            diag_i = dp[col].I;
-            dp[col].C = C;
-            dp[col].D = D;
-            dp[col].I = I;
+            cC[col] = C;
+            cD[col] = D;
+            fcd[col] = flag_c | (flag_d<<2);
+        }
+
+        /* Pass 2: I, which reads C, D and I at (row,col-1), left to right,
+        *  then the traceback byte.
+        */
+        I = MININT;
+        flag_i = 0;	// unused
+        cI[LB[row]] = I;
+        *(tbp++) = fcd[LB[row]] | (flag_i << 4);
+        for (col = LB[row] + 1; col <= RB[row]; ++col) {
+            x = cC[col-1];
+            y = cD[col-1];
+            z = I;
+            /* The main complexity is for the quasi-natural
+            *  gap costs, which depend on the types (C,D,I)
+            *  of the last two edges in a path, i.e., on
+            *  the types of the last two nodes.
+            */
+            if (row < M) {	// not for end-gaps
+                if (col > LB[row-1]+1)
+                    x -= DOT4(gb[col], rt[row].Ix);
+                if (col > LB[row]+1)
+                    z -= Izc[col];
+                y -= vb[col][0]*rt[row].Iy[0] + vb[col][1]*rt[row].Iy[1];
+            }
+            /* Precede the insertion edge with a substitution edge
+            *  (from the C node at (row-1,col)) if that is best,
+            *  else with a deletion edge, else with an insertion.
+            */
+            BEST3(x, y, z, I, flag_i);
+            /* Each of n non-dashes in the inserted column
+            * is aligned to K dashes.
+            */
+            n = vb[col][0];	// non-dashes in the inserted column
+            I -= n*K*gap_extend;
+            cI[col] = I;
 
             // pack three flags into one byte of traceback memory
-            *(tbp++) = flag_c | (flag_d<<2) | (flag_i << 4);
+            *(tbp++) = fcd[col] | (flag_i << 4);
         }
+        C = cC[RB[row]];
+        D = cD[RB[row]];
+
+        sw = pC; pC = cC; cC = sw;
+        sw = pD; pD = cD; cD = sw;
+        sw = pI; pI = cI; cI = sw;
     }
 
+#ifdef YAMA_TBHASH
+    {   /* test instrument: FNV-1a of every traceback byte, and the end scores */
+        unsigned long long h_ = 1469598103934665603ULL; size_t q_;
+        for (q_ = 0; q_ < tback_size; ++q_) { h_ ^= tback[q_]; h_ *= 1099511628211ULL; }
+        printf("TB %016llx %lld %lld %lld\n", h_, C, D, I);
+    }
+#endif
     script = ckalloc((M+N)*sizeof(uchar));
     nedit = 0;
     // start with best node at grid point (M,N)
@@ -404,7 +414,8 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     free(Izc);
     free(tback_row);
     free(tback);
-    free(dp);
+    free(dpbuf);
+    free(fcd);
     free(dashes);
     free(script);
 }
