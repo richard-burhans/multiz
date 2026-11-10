@@ -9,6 +9,9 @@
 #               gap table makes the checks imply each other; see main.c). These are the only cases that
 #               catch a removed range check (tests/simd_mutation).
 #   override    one plain seed with YAMA_SIMD=0 in the environment, which must force the scalar path
+#   targeted    gen.py's narrow, ties and edges modes, seeds 501-503 each: band widths 1-9 and 10-17 (every
+#               vector tail), MININT neighbours, forced C/D/I ties including D/I ties, rows 0 and M, the
+#               first-column waiver and all-dash edge columns
 # On a CPU without AVX2 both builds run scalar and the comparison is vacuous; it says so. Needs python3.
 # Prints PASS/FAIL lines and exits 1 on any FAIL, 0 otherwise (77 = skipped, no python3).
 set -u
@@ -33,10 +36,11 @@ if grep -q -w avx2 /proc/cpuinfo 2> /dev/null; then :; else
 	echo "NOTE yama fuzz: this CPU has no AVX2, so both builds take the scalar path"
 fi
 fail=0
-# cmpcase LABEL SEED NCASES [ENV...]: run both builds on gen.py SEED NCASES 200 under ENV, compare
+# cmpcase LABEL SEED NCASES [ENV...]: run both builds on gen.py SEED NCASES 200 $MODE under ENV, compare
+MODE=random
 cmpcase() {
 	label=$1 seed=$2 nc=$3; shift 3
-	python3 "$H/gen.py" "$seed" "$nc" 200 > "$W/in" || { echo "FAIL $label seed $seed: gen.py"; fail=1; return; }
+	python3 "$H/gen.py" "$seed" "$nc" 200 "$MODE" > "$W/in" || { echo "FAIL $label seed $seed: gen.py"; fail=1; return; }
 	env "$@" "$W/ref" < "$W/in" > "$W/ref.out" 2>&1
 	env "$@" "$W/simd" < "$W/in" > "$W/simd.out" 2>&1
 	if [ -s "$W/ref.out" ] && cmp -s "$W/ref.out" "$W/simd.out"; then
@@ -50,6 +54,10 @@ for s in 301 302; do cmpcase "yama fuzz fits32" $s 300 YAMA_FUZZ_GOP=$GOP; done
 for ix in 2 0 8; do
 	for s in 401 402; do cmpcase "yama fuzz fits32 idx $ix" $s 300 YAMA_FUZZ_GOP=$GOP YAMA_FUZZ_GOP_IDX=$ix; done
 done
+for MODE in narrow ties edges; do
+	for s in 501 502 503; do cmpcase "yama fuzz targeted $MODE" $s 300; done
+done
+MODE=random
 # the run-time override: the dispatch build with YAMA_SIMD=0 must equal the scalar reference too
 python3 "$H/gen.py" 7 300 200 > "$W/in"
 "$W/ref" < "$W/in" > "$W/ref.out" 2>&1
