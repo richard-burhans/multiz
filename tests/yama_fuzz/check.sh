@@ -12,6 +12,9 @@
 #   targeted    gen.py's narrow, ties and edges modes, seeds 501-503 each: band widths 1-9 and 10-17 (every
 #               vector tail), MININT neighbours, forced C/D/I ties including D/I ties, rows 0 and M, the
 #               first-column waiver and all-dash edge columns
+#   real        tests/yama_fuzz/real_cases.txt: yama calls captured from multiz on tests/data/synth/k2l2s1 with a
+#               -DYAMA_DUMP_CASES build (pre_yama's refinement call: one row of A against two of B). They are the
+#               only fuzz input found to expose a D/I tie decided in the vector kernel (the tie_di mutant)
 # On a CPU without AVX2 both builds run scalar and the comparison is vacuous; it says so. Needs python3.
 # Prints PASS/FAIL lines and exits 1 on any FAIL, 0 otherwise (77 = skipped, no python3).
 set -u
@@ -58,6 +61,9 @@ for MODE in narrow ties edges; do
 	for s in 501 502 503; do cmpcase "yama fuzz targeted $MODE" $s 300; done
 done
 MODE=random
+"$W/ref" < "$H/real_cases.txt" > "$W/ref.out" 2>&1
+"$W/simd" < "$H/real_cases.txt" > "$W/simd.out" 2>&1
+if [ -s "$W/ref.out" ] && cmp -s "$W/ref.out" "$W/simd.out"; then echo "PASS yama fuzz real cases"; else echo "FAIL yama fuzz real cases"; fail=1; fi
 # the run-time override: the dispatch build with YAMA_SIMD=0 must equal the scalar reference too
 python3 "$H/gen.py" 7 300 200 > "$W/in"
 "$W/ref" < "$W/in" > "$W/ref.out" 2>&1

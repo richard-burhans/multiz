@@ -396,6 +396,24 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     static int sh_registered;
 #endif
 
+#ifdef YAMA_DUMP_CASES
+    /* Test build: append this call's inputs, in tests/yama_fuzz/main.c's case format, to the file named by
+    *  $YAMA_DUMP_CASES, so real calls (from multiz on real data) become a fixed corpus for the fuzz check. */
+    {
+        const char *dp = getenv("YAMA_DUMP_CASES");
+        FILE *df = dp ? fopen(dp, "a") : NULL;
+        if (df) {
+            fprintf(df, "%d %d\n", K, M);
+            for (i = 1; i <= M; i++) fprintf(df, "%.*s\n", K, A[i]);
+            fprintf(df, "%d %d\n", L, N);
+            for (i = 1; i <= N; i++) fprintf(df, "%.*s\n", L, B[i]);
+            for (i = 0; i <= M; i++) fprintf(df, "%d%c", LB[i], i == M ? '\n' : ' ');
+            for (i = 0; i <= M; i++) fprintf(df, "%d%c", RB[i], i == M ? '\n' : ' ');
+            fclose(df);
+        }
+    }
+#endif
+
     if (LB[0] != 0 || RB[M] != N)
         fatalf("LB and RB not terminated properly: %d %d %d", LB[0], RB[M], N);
     for (tback_size = row = 0; row <= M; row++) {
