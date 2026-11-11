@@ -16,7 +16,8 @@
 #               -DYAMA_SHADOW builds: with the shipped limits it never fires (bound_fallbacks=0) and AVX2 rows run;
 #               with each limit lowered to 0 in turn it fires, and the output still equals the scalar reference;
 #               with YAMA_VBOUND=0 it fires on every call and no row reaches either AVX2 kernel. Needs AVX2 natively
-#               (the check sits on the AVX2 path), so it is skipped under YAMA_FUZZ_RUN or without AVX2
+#               (the check sits on the AVX2 path), so it is skipped under YAMA_FUZZ_RUN, without AVX2, or with
+#               YAMA_SIMD=0 in the environment (tests/validate.sh runs the suite that way too)
 #   real        tests/yama_fuzz/real_cases.txt: yama calls captured from multiz on tests/data/synth/k2l2s1 with a
 #               -DYAMA_DUMP_CASES build (pre_yama's refinement call: one row of A against two of B). They are the
 #               only fuzz input found to expose a D/I tie decided in the vector kernel (the tie_di mutant)
@@ -71,7 +72,7 @@ done
 MODE=random
 # the value-bound check: shadow builds report bound_fallbacks (calls sent to scalar by the check) at exit
 shadow_field() { tr ' ' '\n' < "$1" | sed -n "s/^$2=//p" | head -1; }
-if [ "$AVX2" = 1 ]; then
+if [ "$AVX2" = 1 ] && [ "${YAMA_SIMD-}" != 0 ]; then
 	python3 "$H/gen.py" 9 300 200 > "$W/in"
 	"$W/ref" < "$W/in" > "$W/ref.out" 2>&1
 	for b in ctl:"" v:-DYAMA_VBOUND=0 z:-DYAMA_ZBOUND=0 e:-DYAMA_EBOUND=0; do

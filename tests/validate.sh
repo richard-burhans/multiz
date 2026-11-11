@@ -153,11 +153,14 @@ sanitize-recover)
 			suite "$n" "${envs[@]}" || true
 			deep "$n" "${envs[@]}" || true
 			# tally: the first "#k ... in FUNC FILE:LINE" frame whose FILE is in the build tree, per report
+			# with no report at all there are no log files, and awk must not then read stdin
+			reps=(); for f in "$L"/asan* "$L"/ubsan*; do [ -e "$f" ] && reps+=("$f"); done
+			[ ${#reps[@]} -gt 0 ] || reps=(/dev/null)
 			awk -v root="$VW/$n/" '
 				/ERROR: AddressSanitizer|runtime error/ { want = 1; kind = ($0 ~ /runtime error/) ? "ubsan" : "asan"
 					if (kind == "ubsan") { split($1, a, ":"); f = a[1]; sub(root, "", f); if (f != "") { print kind, f ":" a[2]; want = 0 } } next }
 				want && /^ *#[0-9]+ / && index($0, root) { for (i = 1; i <= NF; i++) if (index($i, root)) { f = $i; sub(root, "", f); sub(/:[0-9]+$/, "", f); print kind, f; want = 0; break } }
-			' "$L"/* 2> /dev/null | sort | uniq -c | sort -rn > "$L/tally"
+			' "${reps[@]}" | sort | uniq -c | sort -rn > "$L/tally"
 			echo "TALLY $n $mode: $(awk '{printf "%s %s x%d; ", $2, $3, $1}' "$L/tally")"
 			grep -q 'mz_yama\.c' "$L/tally" && { echo "FAIL $n $mode: a report from mz_yama.c"; rc=1; }
 		done
