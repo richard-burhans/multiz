@@ -5,9 +5,13 @@
 #   laila_release.sh pack OUT.tar.gz          (local) tar the workloads' inputs, symlinks resolved; KINDS="..." picks
 #                                             which (default: deep piece03 cannabis)
 #   laila_release.sh build                    (in the job, from the bundle root) build base/ and simd/, unpack $DATA;
-#                                             also simd0/ (simd/ built -DYAMA_SIMD=0) and bench/maxrss
-# BUILD in `run` is base, simd, simd0, or simdenv0 (simd/'s binaries with YAMA_SIMD=0 in the environment: the
-# run-time override a user without AVX2 effectively gets).
+#                                             also simd0/ (simd/ built -DYAMA_SIMD=0), simdsh/ (simd/ built
+#                                             -DYAMA_SHADOW) and bench/maxrss; EXTRA="dir ..." builds more trees
+#                                             of the bundle the same way as base/ and simd/
+# BUILD in `run` is base, simd, simd0, simdsh, an EXTRA tree, or simdenv0 (simd/'s binaries with YAMA_SIMD=0 in
+# the environment: the run-time override a user without AVX2 effectively gets). A simdsh run also prints
+#   SHADOW kind round calls=.. rows=.. p1_vec_rows=.. p2_vec_rows=.. unfit_rows=.. bound_fallbacks=..
+# summed over every multiz process of the run (a shadow mismatch aborts the run).
 #   laila_release.sh run KIND BUILD ROUND     (in the job) one timed run; KIND deep | piece03 | cannabis
 #   laila_release.sh compare                  (in the job) every KIND must have one digest across builds and rounds
 #   laila_release.sh summarize RESULTS_DIR    (local) per kind and build: median user s, cycles, instructions, IPC
@@ -56,9 +60,11 @@ pack)
 	ls -l "$out"
 	;;
 build)
-	for t in base simd; do make -s -C "$t" multiz roast maf_project > "build_$t.log" 2>&1 || { tail "build_$t.log"; exit 1; }; done
+	for t in base simd ${EXTRA:-}; do make -s -C "$t" multiz roast maf_project > "build_$t.log" 2>&1 || { tail "build_$t.log"; exit 1; }; done
 	rm -rf simd0 && cp -r simd simd0 && make -s -C simd0 clean > /dev/null 2>&1
 	make -s -C simd0 multiz roast maf_project CFLAGS="-Wall -Wextra -O2 -DYAMA_SIMD=0" > build_simd0.log 2>&1 || { tail build_simd0.log; exit 1; }
+	rm -rf simdsh && cp -r simd simdsh && make -s -C simdsh clean > /dev/null 2>&1
+	make -s -C simdsh multiz roast maf_project CFLAGS="-Wall -Wextra -O2 -DYAMA_SHADOW" > build_simdsh.log 2>&1 || { tail build_simdsh.log; exit 1; }
 	gcc -O2 -o maxrss simd/bench/maxrss.c
 	mkdir -p data && tar -C data -xzf "$DATA"
 	ls data/*
@@ -68,6 +74,7 @@ run)
 	if [ "$build" = simdenv0 ]; then bin=$PWD/simd; export YAMA_SIMD=0; fi
 	d=$PWD/runs/$kind.$build.$round
 	rm -rf "$d"; mkdir -p "$d"
+	if [ "$build" = simdsh ]; then export YAMA_SHADOW_LOG=$d/shadow.log; fi
 	case $kind in
 	deep)
 		tm "$d/time" sh -c '"$0" M=1 data/deep/left.maf data/deep/right.maf 0 "$1/U1.maf" "$1/U2.maf" > "$1/out.maf" 2> "$1/err"' \
@@ -87,6 +94,12 @@ run)
 		dig=$(grep -v '^#' "$d/out.maf" | sha256sum | cut -c1-64) ;;
 	*) echo "unknown kind $kind" >&2; exit 2 ;;
 	esac
+	if [ "$build" = simdsh ]; then
+		awk -v k="$kind" -v r="$round" '/^YAMA_SHADOW calls/ { for (i = 2; i <= NF; i++) { split($i, a, "="); v[a[1]] += a[2] } }
+			END { printf "SHADOW %s %s calls=%d rows=%d p1_vec_rows=%d p2_vec_rows=%d unfit_rows=%d bound_fallbacks=%d\n",
+			      k, r, v["calls"], v["rows"], v["p1_vec_rows"], v["p2_vec_rows"], v["unfit_rows"], v["bound_fallbacks"] }' \
+			"$d/shadow.log" | tee -a runs/shadow.txt
+	fi
 	read -r wall user sys < <(tail -1 "$d/time") # the last line is time's; any earlier ones are the command's stderr
 	echo "RESULT $kind $build $round $wall $user $sys $dig $(cat "$d/maxrss" 2> /dev/null || echo NA)" | tee -a runs/results.txt
 	rm -rf "$d"
