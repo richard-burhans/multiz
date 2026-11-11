@@ -162,7 +162,7 @@ sanitize-recover)
 				want && /^ *#[0-9]+ / && index($0, root) { for (i = 1; i <= NF; i++) if (index($i, root)) { f = $i; sub(root, "", f); sub(/:[0-9]+$/, "", f); print kind, f; want = 0; break } }
 			' "${reps[@]}" | sort | uniq -c | sort -rn > "$L/tally"
 			echo "TALLY $n $mode: $(awk '{printf "%s %s x%d; ", $2, $3, $1}' "$L/tally")"
-			grep -q 'mz_yama\.c' "$L/tally" && { echo "FAIL $n $mode: a report from mz_yama.c"; rc=1; }
+			if grep -q 'mz_yama\.c' "$L/tally"; then echo "FAIL $n $mode: a report from mz_yama.c"; rc=1; fi
 		done
 	done 2>&1 | tee "$VW/sanitize_recover.log"
 	grep -q '^FAIL' "$VW/sanitize_recover.log" && rc=1
