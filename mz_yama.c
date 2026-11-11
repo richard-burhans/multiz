@@ -110,6 +110,24 @@ static const unsigned SPREAD[16] = {
 #define FITS32(v) ((v) >= INT_MIN && (v) <= INT_MAX)
 #endif
 
+/* The value bounds the z3 proof of the I scan assumes (tests/simd_proof/scan_z3.py): every C, D, I value and
+*  every candidate the kernels form within [-2^62 + 2^47, 2^62 - 2^47], |Izc| <= 2^44, and eK within int.  yama()
+*  checks a sufficient condition once per call, before the first row, and runs the whole call on the scalar path
+*  if it fails.  The limits are overridable, so a test build can lower one and see the fallback taken
+*  (tests/yama_fuzz/check.sh, "bound"). */
+#ifndef YAMA_VBOUND	// (M+N) times the largest change one DP edge can make; see yama()
+#define YAMA_VBOUND ((double)(1LL << 60))
+#endif
+#ifndef YAMA_ZBOUND	// max |Izc[col]|
+#define YAMA_ZBOUND ((double)(1LL << 44))
+#endif
+#ifndef YAMA_EBOUND	// K*L*|gap_extend|, which bounds every eK and every D-edge extension
+#define YAMA_EBOUND ((double)INT_MAX)
+#endif
+static double dabs(double v) {
+    return v < 0 ? -v : v;
+}
+
 /* BEST3 on 4 lanes: V is the winner, mi and md flag lanes won by z (I) and
 *  y (D), so the 2-bit flag is FLAG_I*mi | FLAG_D*md, exactly as BEST3.
 */
@@ -296,7 +314,7 @@ static score_t i_avx2(int lo, int hi, const score_t *cC, const score_t *cD,
 */
 #include <stdio.h>
 static unsigned long long sh_calls, sh_rows, sh_cells, sh_p1_vrows, sh_p1_vcells,
-       sh_p2_vrows, sh_p2_vcells, sh_unfit_rows;
+       sh_p2_vrows, sh_p2_vcells, sh_unfit_rows, sh_bound_fallbacks;
 static score_t sh_vmin = LLONG_MAX, sh_vmax = LLONG_MIN, sh_vmin_nonsentinel = LLONG_MAX,
                sh_zmax, sh_emax;
 static void sh_report(void) {
@@ -311,10 +329,11 @@ static void sh_report(void) {
             continue;
         fprintf(o, "YAMA_SHADOW calls=%llu rows=%llu cells=%llu p1_vec_rows=%llu "
             "p1_vec_cells=%llu p2_vec_rows=%llu p2_vec_cells=%llu unfit_rows=%llu "
-            "vmin=%lld vmin_above_MININT=%lld vmax=%lld max_abs_Izc=%lld max_abs_eK=%lld\n",
+            "vmin=%lld vmin_above_MININT=%lld vmax=%lld max_abs_Izc=%lld max_abs_eK=%lld "
+            "bound_fallbacks=%llu\n",
             sh_calls, sh_rows, sh_cells, sh_p1_vrows, sh_p1_vcells, sh_p2_vrows,
             sh_p2_vcells, sh_unfit_rows, sh_vmin, sh_vmin_nonsentinel, sh_vmax,
-            sh_zmax, sh_emax);
+            sh_zmax, sh_emax, sh_bound_fallbacks);
     }
     if (f)
         fclose(f);
@@ -385,6 +404,7 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
     int simd, vhi, *rowok = NULL;
     long long *cs = NULL;
     size_t stride = 0;
+    double zmax, emax, pmax;	// the value-bound check
 #endif
 #if YAMA_SIMD && YAMA_SIMD_I
     long long *eK = NULL;
@@ -616,13 +636,39 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
                 cs[(6 + k)*stride + col] = hist[(size_t)col*nsym + k];
         }
         rowok = ckalloc((M+1)*sizeof(int));
-        /* Under the shipped gap table every nonzero gap-open entry is equal, so the Cx, Cz and Ix checks are implied
-        *  by the Cy, Dx, Dz and Iy checks: tests/simd_mutation/real_table_checks.sh removes them at every magnitude
-        *  of a real-shaped table and the output never changes. They stay, at one comparison per row, so a future
-        *  configurable gap table cannot reach the 32-bit multiplies unchecked. */
+        /* The value-bound check (see YAMA_VBOUND).  Every DP value is reached from (0,0), or from a MININT sentinel,
+        *  along at most M+N edges, and one edge changes a value by at most P = L*(cmax + wmax) + |Dy| + zmax + emax:
+        *  the gap terms are counts of B's rows (summing to L) times this row's coefficients (at most cmax each),
+        *  or Dy, or Izc; the substitution sum is counts times wA (at most wmax); the extension is at most emax.  So
+        *  every value and candidate lies in [MININT - (M+N)*Pmax, (M+N)*Pmax].  With (M+N)*Pmax <= 2^60, and
+        *  MININT = -2^61, that is inside [-2^62 + 2^47, 2^62 - 2^47].  The sums are in double, whose relative
+        *  error here (a few roundings of 2^-53) cannot carry a bound of 2^60 past 2^61 - 2^47, and which cannot
+        *  overflow.  Under the shipped tables (gap open at most 600, |ss| at most 157, gap_extend at most 50) and
+        *  K = L = 216, Pmax < 2^27, and M + N < 2^32, so the check cannot fail on such input; it stops a larger
+        *  table or a far deeper input from leaving the proved range unnoticed. */
+        zmax = 0;
+        for (col = 1; col <= N; ++col)
+            zmax = MAX(zmax, dabs((double)Izc[col]));
+        emax = dabs((double)K*L*gap_extend);
+        pmax = 0;
+        /* The FITS32 checks keep _mm256_mul_epi32, which multiplies the low 32 bits only, exact.  Under the shipped
+        *  gap table every nonzero gap-open entry is equal, so the Cx, Cz and Ix checks are implied by the Cy, Dx, Dz
+        *  and Iy checks: tests/simd_mutation/real_table_checks.sh removes them at every magnitude of a real-shaped
+        *  table and the output never changes.  They are kept as a defence anyway, at a few comparisons per row:
+        *  they guard any other gap table (a configurable one, or a test's) and any input that breaks the implication,
+        *  and check.sh's "fits32 idx" cases, which set one gap-open entry at a time, fail if any one is removed. */
         for (row = 1; row <= M; ++row) {
             row_tab *r = rt + row;
             int ok = 1;
+            double cmax = 0, wmax = 0;
+            for (k = 0; k < 4; ++k)
+                cmax = MAX(cmax, MAX(dabs((double)r->Cx[k]), MAX(dabs((double)r->Cz[k]), dabs((double)r->Ix[k]))));
+            for (k = 0; k < 2; ++k)
+                cmax = MAX(cmax, MAX(MAX(dabs((double)r->Cy[k]), dabs((double)r->Iy[k])),
+                                     MAX(dabs((double)r->Dx[k]), dabs((double)r->Dz[k]))));
+            for (k = 0; k < nsym; ++k)
+                wmax = MAX(wmax, dabs((double)wA[(size_t)row*nsym + k]));
+            pmax = MAX(pmax, (double)L*(cmax + wmax) + dabs((double)r->Dy) + zmax + emax);
             for (k = 0; k < 4; ++k)
                 ok &= FITS32(r->Cx[k]) & FITS32(r->Cz[k]);
             for (k = 0; k < 2; ++k)
@@ -637,6 +683,14 @@ void yama(uchar **A, int K, int M, uchar **B, int L, int N, int *LB, int *RB,
 #endif
             rowok[row] = ok;
         }
+        if (!(zmax <= YAMA_ZBOUND && emax <= YAMA_EBOUND && (double)(M + N)*pmax <= YAMA_VBOUND)) {
+            simd = 0;	// this call runs on the scalar path, exactly as with YAMA_SIMD=0
+#ifdef YAMA_SHADOW
+            ++sh_bound_fallbacks;
+#endif
+        }
+    }
+    if (simd) {
 #if YAMA_SIMD_I
         eK = ckalloc(stride*sizeof(long long));
         for (col = 1; col <= N; ++col) {

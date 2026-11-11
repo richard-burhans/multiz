@@ -12,6 +12,11 @@
 #   targeted    gen.py's narrow, ties and edges modes, seeds 501-503 each: band widths 1-9 and 10-17 (every
 #               vector tail), MININT neighbours, forced C/D/I ties including D/I ties, rows 0 and M, the
 #               first-column waiver and all-dash edge columns
+#   bound       the value-bound check (YAMA_VBOUND, YAMA_ZBOUND, YAMA_EBOUND in mz_yama.c), on a plain seed with
+#               -DYAMA_SHADOW builds: with the shipped limits it never fires (bound_fallbacks=0) and AVX2 rows run;
+#               with each limit lowered to 0 in turn it fires, and the output still equals the scalar reference;
+#               with YAMA_VBOUND=0 it fires on every call and no row reaches either AVX2 kernel. Needs AVX2 natively
+#               (the check sits on the AVX2 path), so it is skipped under YAMA_FUZZ_RUN or without AVX2
 #   real        tests/yama_fuzz/real_cases.txt: yama calls captured from multiz on tests/data/synth/k2l2s1 with a
 #               -DYAMA_DUMP_CASES build (pre_yama's refinement call: one row of A against two of B). They are the
 #               only fuzz input found to expose a D/I tie decided in the vector kernel (the tie_di mutant)
@@ -37,7 +42,8 @@ build() {
 }
 build ref -DYAMA_SIMD=0
 build simd ""
-if [ -z "$FRUN" ] && grep -q -w avx2 /proc/cpuinfo 2> /dev/null; then :; else
+AVX2=0
+if [ -z "$FRUN" ] && grep -q -w avx2 /proc/cpuinfo 2> /dev/null; then AVX2=1; else
 	echo "NOTE yama fuzz: this CPU has no AVX2, so both builds take the scalar path"
 fi
 fail=0
@@ -63,6 +69,29 @@ for MODE in narrow ties edges; do
 	for s in 501 502 503; do cmpcase "yama fuzz targeted $MODE" $s 300; done
 done
 MODE=random
+# the value-bound check: shadow builds report bound_fallbacks (calls sent to scalar by the check) at exit
+shadow_field() { tr ' ' '\n' < "$1" | sed -n "s/^$2=//p" | head -1; }
+if [ "$AVX2" = 1 ]; then
+	python3 "$H/gen.py" 9 300 200 > "$W/in"
+	"$W/ref" < "$W/in" > "$W/ref.out" 2>&1
+	for b in ctl:"" v:-DYAMA_VBOUND=0 z:-DYAMA_ZBOUND=0 e:-DYAMA_EBOUND=0; do
+		n=${b%%:*}
+		build "b$n" "-DYAMA_SHADOW ${b#*:}"
+		"$W/b$n" < "$W/in" > "$W/b$n.out" 2> "$W/b$n.err"
+		fb=$(shadow_field "$W/b$n.err" bound_fallbacks) calls=$(shadow_field "$W/b$n.err" calls)
+		p1=$(shadow_field "$W/b$n.err" p1_vec_rows) p2=$(shadow_field "$W/b$n.err" p2_vec_rows)
+		case $n in
+		ctl) ok=$([ "${fb:-x}" = 0 ] && [ "${p1:-0}" -gt 0 ] && [ "${p2:-0}" -gt 0 ] && echo 1) ;;
+		v) ok=$([ "${fb:-0}" -gt 0 ] && [ "$fb" = "$calls" ] && [ "${p1:-x}" = 0 ] && [ "${p2:-x}" = 0 ] && echo 1) ;;
+		*) ok=$([ "${fb:-0}" -gt 0 ] && echo 1) ;;
+		esac
+		if [ "$ok" = 1 ] && [ -s "$W/ref.out" ] && cmp -s "$W/ref.out" "$W/b$n.out"; then
+			echo "PASS yama fuzz bound $n (bound_fallbacks=$fb of $calls calls, p1_vec_rows=$p1)"
+		else
+			echo "FAIL yama fuzz bound $n (bound_fallbacks=${fb:-?} of ${calls:-?} calls, p1_vec_rows=${p1:-?})"; fail=1
+		fi
+	done
+fi
 $FRUN "$W/ref" < "$H/real_cases.txt" > "$W/ref.out" 2>&1
 $FRUN "$W/simd" < "$H/real_cases.txt" > "$W/simd.out" 2>&1
 if [ -s "$W/ref.out" ] && cmp -s "$W/ref.out" "$W/simd.out"; then echo "PASS yama fuzz real cases"; else echo "FAIL yama fuzz real cases"; fail=1; fi

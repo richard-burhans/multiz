@@ -86,6 +86,17 @@ MUTANTS = [
     ("fits_inverted", "range check inverted",
      "#define FITS32(v) ((v) >= INT_MIN && (v) <= INT_MAX)",
      "#define FITS32(v) (!((v) >= INT_MIN && (v) <= INT_MAX))"),
+    # The value-bound check (YAMA_VBOUND etc.): these change no output (the bounds are never approached), so only
+    # check.sh's "bound" cases, which read the shadow counters, can kill them.
+    ("bound_ignored", "value-bound check: a failed check does not send the call to scalar",
+     "simd = 0;\t// this call runs on the scalar path, exactly as with YAMA_SIMD=0",
+     "(void)0;"),
+    ("bound_v_removed", "value-bound check: (M+N)*Pmax not checked",
+     " && (double)(M + N)*pmax <= YAMA_VBOUND", ""),
+    ("bound_z_removed", "value-bound check: |Izc| not checked",
+     "zmax <= YAMA_ZBOUND && ", ""),
+    ("bound_e_removed", "value-bound check: K*L*|gap_extend| not checked",
+     " && emax <= YAMA_EBOUND", ""),
 ]
 
 

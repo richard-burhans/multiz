@@ -92,8 +92,11 @@ UCSC's files, not generated, and `regen.sh` leaves it alone.
 `tests/yama_fuzz/check.sh` builds yama twice from the tree, as a scalar reference (`-DYAMA_SIMD=0`) and as the
 normal build that picks the AVX2 kernels at run time, and requires identical output on random cases from
 `gen.py`. It covers plain cases, gap opens of 2^28 that push row coefficients past 32 bits (the scalar fallback),
-one range check at a time (`YAMA_FUZZ_GOP_IDX`), and the run-time override `YAMA_SIMD=0`. It takes a few
-seconds and needs python3 (it reports SKIP without it). On a CPU without AVX2 both builds run scalar, and it
+one range check at a time (`YAMA_FUZZ_GOP_IDX`), and the run-time override `YAMA_SIMD=0`. It also tests the
+value-bound check that sends a call to the scalar path when its scores could leave the range the AVX2 I scan is
+proved for: with `-DYAMA_SHADOW` builds it checks that the check never fires at the shipped limits, and that it
+fires, with unchanged output, when each limit is lowered to 0 (`-DYAMA_VBOUND=0`, `YAMA_ZBOUND`, `YAMA_EBOUND`).
+It takes a few seconds and needs python3 (it reports SKIP without it). On a CPU without AVX2 both builds run scalar, and it
 says so. `tests/yama_fuzz/run.sh` compares two trees instead (e.g. against a release).
 
 ## CPUs without AVX2
