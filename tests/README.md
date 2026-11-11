@@ -103,6 +103,17 @@ says so. `tests/yama_fuzz/run.sh` compares two trees instead (e.g. against a rel
 `-DYAMA_SIMD=0` build, that a `-DYAMA_SHADOW` build counts no vector rows there (and some under `-cpu Haswell`,
 as a positive control), and that the whole `tests/run.sh` suite passes with every program run that way.
 
+## Another allocator
+
+`tests/allocator_check.sh BINDIR [N]` runs `multiz` on a deep merge once
+under glibc, then N times under jemalloc (plain, and with
+`MALLOC_CONF=junk:true`), and reports crashes and any output that differs
+from glibc's. It is not in `make check`, because it needs libjemalloc2
+(`apt install libjemalloc2`) and real input data. It exists because two
+overruns in `pre_yama` read memory outside their arrays. glibc's chunk
+headers made the stray reads harmless, but jemalloc (standing in for macOS
+malloc, which bioconda's osx builds use) let stock 11.9 segfault.
+
 ## Not here
 
 The large-data checks need data that is not in the repository and are run
