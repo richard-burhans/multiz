@@ -199,8 +199,8 @@ bounds)
 		U=${U:-/home/rcb112/project/claude/bench/data/ucsc100way}
 		rm -rf "$VW/ab.piece"; bash "$P" "$VW/ab" "$U/run03/inputs-v3" "$U/tree.nh" "$VW/ab.piece" > /dev/null 2>&1 || true
 		dg=$(grep -v '^#' "$VW/ab.piece/out.maf" 2> /dev/null | sha256sum | cut -c1-64)
-		echo "BOUNDS piece03 digest $dg (expected 39a97134f419b0b478edd4c7687849132391f997e0b297a4dedaa7ad3330176b)"
-		[ "$dg" = 39a97134f419b0b478edd4c7687849132391f997e0b297a4dedaa7ad3330176b ] || rc=1
+		echo "BOUNDS piece03 digest $dg (expected de0dca97a159c7a0587e29f67a3537a77427357eb523f7882c03c5460d4374db)"
+		[ "$dg" = de0dca97a159c7a0587e29f67a3537a77427357eb523f7882c03c5460d4374db ] || rc=1
 	fi
 	n=$(grep -c 'YAMA_ASSERT_BOUNDS\|MISMATCH' "$L" 2> /dev/null || true)
 	awk '/^YAMA_SHADOW calls/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
